@@ -311,6 +311,12 @@ GDN_DECODE_KERNEL="${GDN_DECODE_KERNEL:-}"
 # that removes MTP's fixed prefix-cache-block back-off per turn. MTP_NUM_...
 # > 0 and this knob = merge into the speculative-config JSON.
 MTP_DISABLE_BLOCK_DROP="${MTP_DISABLE_BLOCK_DROP:-0}"
+# index_share_for_mtp_iteration: draft steps 1+ reuse the sparse indices that
+# step 0 computed, so they skip the draft QSA indexer. The saving grows with
+# context. The speculative-config field writes only this key onto the draft
+# config (config/speculative.py:1180), so the YaRN override is not copied.
+# Proof that it arrived: the "MTP index share: ... ACTIVE" log line.
+MTP_INDEX_SHARE="${MTP_INDEX_SHARE:-0}"
 
 DO_LAUNCH=true
 for arg in "$@"; do
@@ -655,6 +661,7 @@ PATCHED_MTP="$SCRIPT_DIR/files/mtp_patched.py"
 extract "$MTP_PKG" "$PATCHED_MTP.orig"
 python3 "$SCRIPT_DIR/files/patch_mtp_draft_vocab.py"
 [[ -f "$PATCHED_MTP" ]] || err "MTP patch missing after patch_mtp_draft_vocab.py"
+python3 "$SCRIPT_DIR/files/patch_mtp_fp8_head.py" || err "patch_mtp_fp8_head.py failed"
 
 OFFLOAD_DIR="$SCRIPT_DIR/files/ple_offload"
 mkdir -p "$OFFLOAD_DIR/orig"
@@ -867,7 +874,10 @@ if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
     _MTP_BLOCK=""; _MTP_CR=""; _MTP_INTRO_SRC="fallback"
     _MTP_INTRO_FILE="$_MTP_CACHE_DIR/mtp-ring-$(printf '%s' "$SNAP" | cut -c1-16)"
     if [[ -r "$_MTP_INTRO_FILE" ]]; then
-        read -r _MTP_BLOCK _MTP_CR < "$_MTP_INTRO_FILE" && _MTP_INTRO_SRC="cache"
+        # Accept only "<int> <int>": an old cache could hold a vLLM log line
+        # ("INFO 09-23 ..."), and "09" then breaks bash arithmetic as octal.
+        _MTP_CACHED=$(grep -E '^[0-9]+ [0-9]+$' "$_MTP_INTRO_FILE" | tail -1)
+        [[ -n "$_MTP_CACHED" ]] && read -r _MTP_BLOCK _MTP_CR <<< "$_MTP_CACHED" && _MTP_INTRO_SRC="cache"
     fi
     if [[ -z "$_MTP_BLOCK" ]]; then
         # Best-effort; any failure falls through to the known-good table.
@@ -894,7 +904,7 @@ for mod in ("vllm.models.qwen3_8_flash_next.nvidia.qsa",
 if bs is None:
     bs = 0
 print(f"{int(bs)} {cr}")
-' 2>/dev/null || true)
+' 2>/dev/null | grep -E '^[0-9]+ [0-9]+$' | tail -1 || true)
         if [[ -n "$_MTP_INTRO" ]]; then
             read -r _MTP_BLOCK _MTP_CR <<< "$_MTP_INTRO"
             [[ -n "$_MTP_BLOCK" && -n "$_MTP_CR" ]] && _MTP_INTRO_SRC="introspect" \
@@ -938,6 +948,7 @@ if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
     # prefix-cache-block back-off per turn. Merged the same way as the other
     # scalars; a vLLM that does not know the key ignores it harmlessly.
     [[ "$MTP_DISABLE_BLOCK_DROP" == "1" ]] && _SPEC_ARGMAX+=',"disable_eagle_block_drop":true'
+    [[ "$MTP_INDEX_SHARE" == "1" ]] && _SPEC_ARGMAX+=',"index_share_for_mtp_iteration":true'
     _SPEC_SCHED=""
     if [[ -n "$MTP_K_SCHEDULE" ]]; then
         _SPEC_SCHED=",\"num_speculative_tokens_per_batch_size\":[$(
@@ -1095,7 +1106,9 @@ ARCHIVE_TS=$(date '+%Y%m%dT%H%M%S')
 # -probe-latency.log) members. 24/7 relauches run on a scheduled cadence, so
 # without a prune the archive grows forever and threatens the checkpoint
 # disk cache.
-ls -1t "$SCRIPT_DIR"/logs/archive/*-container.log 2>/dev/null | tail -n +21 | while read -r f; do
+# "|| true": on a fresh install the glob matches nothing, ls exits 2, and
+# pipefail would stop the launch here without a message.
+{ ls -1t "$SCRIPT_DIR"/logs/archive/*-container.log 2>/dev/null || true; } | tail -n +21 | while read -r f; do
     _set="${f%-container.log}"
     rm -f "${_set}-container.log" "${_set}-memwatch.log" "${_set}-probe-latency.log" "${_set}-timeout.log" 2>/dev/null || true
 done

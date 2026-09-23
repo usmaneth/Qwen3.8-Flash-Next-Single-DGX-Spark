@@ -116,3 +116,15 @@
 #   files/ple_layer_patched.py, files/modelopt_patched.py,
 #   files/mtp_patched.py,
 #   files/ple_offload/*.py    generated from the .orig copies on every launch
+
+# spark-tuning branch: patch generators and serving profiles for the DGX Spark
+# pair (spark1/spark2). The generated files under files/ours/ are rebuilt from
+# the image with the patch_*.py generators and stay ignored.
+!/files/patch_mtp_fp8_head.py
+!/files/ours/
+/files/ours/*
+!/files/ours/patch_block_drop.py
+!/files/ours/patch_capture.py
+!/files/ours/patch_lm_head_fp8.py
+!/profiles/
+!/profiles/spark1-best.env
