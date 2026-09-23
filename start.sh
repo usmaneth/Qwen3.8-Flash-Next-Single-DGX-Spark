@@ -876,7 +876,7 @@ if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
     if [[ -r "$_MTP_INTRO_FILE" ]]; then
         # Accept only "<int> <int>": an old cache could hold a vLLM log line
         # ("INFO 09-23 ..."), and "09" then breaks bash arithmetic as octal.
-        _MTP_CACHED=$(grep -E '^[0-9]+ [0-9]+$' "$_MTP_INTRO_FILE" | tail -1)
+        _MTP_CACHED=$(grep -E '^[0-9]+ [0-9]+$' "$_MTP_INTRO_FILE" | tail -1 || true)
         [[ -n "$_MTP_CACHED" ]] && read -r _MTP_BLOCK _MTP_CR <<< "$_MTP_CACHED" && _MTP_INTRO_SRC="cache"
     fi
     if [[ -z "$_MTP_BLOCK" ]]; then
