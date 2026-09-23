@@ -1016,8 +1016,8 @@ can fire while GiBs of clean page cache are still resident: on 2026-09-23
 08:36 it stopped spark1 at `MemFree` 1.2 GiB and `MemAvailable` 8.3 GiB with
 5.7 GiB cached. With relief on, after `MEMWATCH_RELIEF_AT` (2) sub-floor
 samples, and when at least `MEMWATCH_RELIEF_MIN_GIB` (1) of file cache is
-reclaimable, the watchdog runs `sudo -n sh -c 'echo 1 >
-/proc/sys/vm/drop_caches'` under `timeout -k 2 10`. Then it logs `MemFree`,
+reclaimable, the watchdog runs `echo 1 | sudo -n tee
+/proc/sys/vm/drop_caches` under `timeout -k 2 10`. Then it logs `MemFree`,
 `MemAvailable` and the reclaimable cache before and after, resets the
 counter, and stops only if the floor holds for 5 more samples. It does this
 at most once per `MEMWATCH_RELIEF_INTERVAL` (60) seconds. A failed relief

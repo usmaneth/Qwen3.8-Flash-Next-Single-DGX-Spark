@@ -31,7 +31,7 @@
 # MemAvailable 8.3 GiB, 5.7 GiB cached). When the MemFree trigger has counted
 # MEMWATCH_RELIEF_AT samples (default 2, less than CONSEC) and the reclaimable
 # file cache is at least MEMWATCH_RELIEF_MIN_GIB (default 1), the watchdog
-# runs `echo 1 > /proc/sys/vm/drop_caches` through `sudo -n` under
+# writes 1 to /proc/sys/vm/drop_caches through `sudo -n tee` under
 # `timeout -k 2 10`, logs the result, resets the MemFree counter and keeps
 # sampling. If the condition holds for CONSEC more samples, it stops the
 # container as before. No `sync`: drop_caches drops only clean pages, and
@@ -56,7 +56,7 @@
 #     np.memmap, so drop_caches skips them. It drops only unmapped cache,
 #     for example the checkpoint read at load time.
 # The sudoers rule the relief needs (visudo -f /etc/sudoers.d/memwatch):
-#   <user> ALL=(root) NOPASSWD: /usr/bin/sh -c echo 1 > /proc/sys/vm/drop_caches
+#   <user> ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches
 #
 # Every 10 s it also counts NV_ERR_NO_MEMORY lines the kernel log gained since
 # the previous check; that is the earliest signal this box gives and is logged
@@ -99,7 +99,7 @@ RELIEF="${MEMWATCH_RELIEF:-off}"
 RELIEF_AT="${MEMWATCH_RELIEF_AT:-2}"
 RELIEF_MIN_GIB="${MEMWATCH_RELIEF_MIN_GIB:-1}"
 RELIEF_INTERVAL="${MEMWATCH_RELIEF_INTERVAL:-60}"
-RELIEF_CMD="${MEMWATCH_RELIEF_CMD:-sudo -n sh -c 'echo 1 > /proc/sys/vm/drop_caches'}"
+RELIEF_CMD="${MEMWATCH_RELIEF_CMD:-echo 1 | sudo -n tee /proc/sys/vm/drop_caches > /dev/null}"
 RELIEF_TIMEOUT_S="${MEMWATCH_RELIEF_TIMEOUT_S:-10}"
 RELIEF_KILL_S=2                   # timeout -k: SIGKILL this long after SIGTERM
 RELIEF_WAIT_STEPS=20              # wait up to 20 x 0.05 s for a relief inline

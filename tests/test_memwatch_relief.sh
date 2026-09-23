@@ -26,7 +26,7 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-BASELINE_REV=f1b7e27   # memwatch.sh before the relief step
+BASELINE_REV=6b50864   # memwatch.sh before the relief step
 
 FAKEBIN="$TMP/bin"
 mkdir -p "$FAKEBIN" "$TMP/repo/files"
@@ -282,7 +282,7 @@ for mode in "${MODES[@]}"; do
     run_mw "$mode" B B B B B OK
     check "exit 2" '[[ $RC == 2 ]]'
     check "sudo called once with -n and the drop_caches command" \
-        '[[ $(calls sudo_calls) == 1 && "$(cat "$STATE/sudo_calls")" == "-n sh -c echo 1 > /proc/sys/vm/drop_caches" ]]'
+        '[[ $(calls sudo_calls) == 1 && "$(cat "$STATE/sudo_calls")" == "-n tee /proc/sys/vm/drop_caches" ]]'
     check "sudo refusal logged" '[[ $(count "RELIEF FAILED (exit 1, [0-9]* ms): sudo: a password is required") == 1 ]]'
 
     echo "-- rate limit: one relief per MEMWATCH_RELIEF_INTERVAL"
