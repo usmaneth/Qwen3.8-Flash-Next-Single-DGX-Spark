@@ -96,7 +96,6 @@
 # Host-specific, but they carry the numbers the README and CHANGELOG cite.
 !/docs/synthesis-astra-fable-2026-09-05.md
 !/docs/overnight-2026-09-05.md
-!/docs/goal-overnight-2026-09-05.md
 # Serving Spanish: draft-vocab coverage, per-mode sampling, benchmark
 # comparability (oscarmenendezgarcia). The 65k ES-extended vocab cites it.
 !/docs/spanish-drafting-and-performance-2026-09-13.md
