@@ -52,6 +52,7 @@
 !/files/ple_io/bench_ple_io.py
 !/files/ple_io/ple_io_defer.py
 !/files/ple_io/patch_defer.py
+!/files/ple_io/test_defer.py
 !/files/ple_io/ple_io_fast.py
 !/files/ple_io/patch_fast.py
 !/files/ple_io/test_fast.py
