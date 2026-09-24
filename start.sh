@@ -119,7 +119,8 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     EXTRA_VLLM_ARGS EXTRA_DOCKER_ARGS NATIVE_MAX_MODEL_LEN
                     YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S API_KEY
                     VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
-                    MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE)
+                    MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE
+                    QSA_INDEXER_TILED GDN_PREFILL_FLASHINFER HC_GATE_FUSED)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAP_$_v=\${$_v-}"
     eval "_SNAPSET_$_v=\${$_v+set}"
@@ -664,6 +665,21 @@ extract "$QSA_OPS_PKG"    "$PATCHED_QSA_OPS.orig"
 extract "$QSA_NVIDIA_PKG" "$PATCHED_QSA_NVIDIA.orig"
 python3 "$SCRIPT_DIR/files/patch_qsa_fp8_kv.py"
 [[ -f "$PATCHED_QSA_OPS" && -f "$PATCHED_QSA_NVIDIA" ]] || err "QSA fp8 patch missing after patch_qsa_fp8_kv.py"
+# prefill-ttft B5: row-tiled QSA indexer score kernel. Off by default.
+if [[ "${QSA_INDEXER_TILED:-0}" == "1" ]]; then
+    python3 "$SCRIPT_DIR/files/patch_qsa_indexer_tiled.py" || err "patch_qsa_indexer_tiled.py failed"
+fi
+# prefill-ttft B3/B6: generated files under files/ours (patch_gdn_fi.py,
+# patch_hc_gate_fused.py) mounted over the image files. Off by default.
+PT_EXTRA_MOUNTS=""
+if [[ "${GDN_PREFILL_FLASHINFER:-0}" == "1" ]]; then
+    [[ -f "$SCRIPT_DIR/files/ours/qwen_gdn_linear_attn.py" ]] || err "run files/ours/patch_gdn_fi.py first"
+    PT_EXTRA_MOUNTS+=" -v $SCRIPT_DIR/files/ours/qwen_gdn_linear_attn.py:$VLLM_PKG/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:ro"
+fi
+if [[ "${HC_GATE_FUSED:-0}" == "1" ]]; then
+    [[ -f "$SCRIPT_DIR/files/ours/hyperconnection.py" ]] || err "run files/ours/patch_hc_gate_fused.py first"
+    PT_EXTRA_MOUNTS+=" -v $SCRIPT_DIR/files/ours/hyperconnection.py:$VLLM_PKG/models/qwen3_8_flash_next/nvidia/hyperconnection.py:ro"
+fi
 
 # Reduced-vocabulary drafting. The patch is inert unless VLLM_MTP_DRAFT_VOCAB
 # is set in the container, so it is applied unconditionally.
@@ -1089,6 +1105,7 @@ docker run \\
     -v $OFFLOAD_DIR/protocol.py:$VLLM_PKG/v1/ple_offload/protocol.py:ro \\
     -v $HF_CACHE_DIR:/root/.cache/huggingface \\
     -v $HOME/.cache/vllm:/root/.cache/vllm \\
+    $PT_EXTRA_MOUNTS \\
     $EXTRA_DOCKER_ARGS \\
     $IMAGE \\
     $MODEL_ID \\
