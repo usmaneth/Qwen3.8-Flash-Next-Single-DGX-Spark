@@ -82,6 +82,7 @@
 !/tests/test_memwatch_relief.sh
 !/tests/test_ple_staging_width.py
 !/tests/test_mtp_block.py
+!/tests/test_split.py
 
 # --- benchmark harness (2026-09-05/06 overnight sweep) ------------------
 # The published numbers are sparkDash's; these drive sparkDash one
@@ -132,5 +133,9 @@
 !/files/ours/patch_block_drop.py
 !/files/ours/patch_capture.py
 !/files/ours/patch_lm_head_fp8.py
+# prefill-ttft: Mamba-grid split generator (run after patch_block_drop.py) and
+# the runtime A/B flag module that start.sh mounts at vllm/pt_flags.py.
+!/files/ours/patch_mamba_grid.py
+!/files/ours/pt_flags.py
 !/profiles/
 !/profiles/spark1-best.env
