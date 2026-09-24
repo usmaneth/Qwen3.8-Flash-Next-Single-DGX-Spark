@@ -100,6 +100,7 @@ NEW_TAIL = '''        # Stop at the earliest mandatory position strictly inside 
             end -= block_size
             reason += "+lookahead"
         if self._pt_debug_split:
+            self._pt_split_end[request.request_id] = end
             logger.info(
                 "PTDBG split req=%s start=%d end=%d n=%d prompt=%d grid=%d "
                 "reason=%s",
@@ -166,11 +167,17 @@ NEW_TAIL = '''        # Stop at the earliest mandatory position strictly inside 
             return verdict, f"{kind}{pos}"
 
         def cache_blocks(request, num_tokens, retention_interval=None):
+            # The coordinator rounds num_tokens down to the scheduler block,
+            # so take the real step end from the split of this step.
             blocks = mgr.req_to_blocks.get(request.request_id, [])
-            idx = (num_tokens - 1) // mamba_block
-            if num_tokens > 0 and idx < len(blocks) and not blocks[idx].is_null:
-                kind = "p" if num_tokens <= request.num_prompt_tokens else "d"
-                state_pos[blocks[idx].block_id] = (kind, num_tokens)
+            end = self._pt_split_end.pop(request.request_id, None)
+            if end is None:
+                end, kind = num_tokens, "d"
+            else:
+                kind = "p"
+            idx = (end - 1) // mamba_block
+            if end > 0 and idx < len(blocks) and not blocks[idx].is_null:
+                state_pos[blocks[idx].block_id] = (kind, end)
             before = mgr.num_cached_block.get(request.request_id, 0)
             orig_cache_blocks(
                 request, num_tokens, retention_interval=retention_interval
@@ -231,6 +238,7 @@ NEW_INIT = '''        # prefill-ttft B1: the grid of the align split is the Mamb
             self.cache_config.block_size,
         )
         self._pt_debug_split = os.environ.get("PT_DEBUG_SPLIT") == "1"
+        self._pt_split_end: dict[str, int] = {}
         if self.need_mamba_block_aligned_split:
             logger.info(
                 "prefill-ttft B1: align split grid %d (Mamba group block), "
