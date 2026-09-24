@@ -72,7 +72,9 @@ DEFAULTS = {
     "backend": "pm",
     "threads": "8",
     "batch_min": "4096",
-    "defer": "0",
+    # B2 default from L1: the GPU gap per cold 8K chunk fell from 48.9 to
+    # 6.5 ms (r1) and 53.3 to 10.5 ms (r2). Rollback: VLLM_PLE_IO_DEFER=0.
+    "defer": "1",
     "fast": "0",
     "check": "0",
     "trace": "1" if TRACE_DIR else "0",
