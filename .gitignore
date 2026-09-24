@@ -137,5 +137,9 @@
 # the runtime A/B flag module that start.sh mounts at vllm/pt_flags.py.
 !/files/ours/patch_mamba_grid.py
 !/files/ours/pt_flags.py
+!/files/ours/patch_gdn_fi.py
+!/files/ours/patch_hc_gate_fused.py
+# prefill-ttft: row-tiled QSA indexer (start.sh runs it after patch_qsa_fp8_kv.py)
+!/files/patch_qsa_indexer_tiled.py
 !/profiles/
 !/profiles/spark1-best.env
