@@ -65,9 +65,12 @@ TRACE_DIR = os.environ.get("VLLM_PLE_IO_TRACE_DIR", "").strip()
 KEYS = ("mode", "backend", "threads", "batch_min", "defer", "fast", "check",
         "trace", "res")
 DEFAULTS = {
-    "mode": "fadvise",
-    "backend": "c",
-    "threads": "4",
+    # B1 defaults from L1 (spark1, l1-20260924T124323): the microbench picked
+    # pm with 8 threads (43.8 ms for a cold 131,072-row set, fadvise 94.8 ms).
+    # Rollback: VLLM_PLE_IO_MODE=fadvise.
+    "mode": "batch",
+    "backend": "pm",
+    "threads": "8",
     "batch_min": "4096",
     "defer": "0",
     "fast": "0",
