@@ -120,7 +120,7 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S API_KEY
                     VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
                     MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE
-                    QSA_INDEXER_TILED GDN_PREFILL_FLASHINFER HC_GATE_FUSED)
+                    QSA_INDEXER_TILED GDN_PREFILL_FLASHINFER HC_GATE_FUSED PREFILL_BLOCKS)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAP_$_v=\${$_v-}"
     eval "_SNAPSET_$_v=\${$_v+set}"
@@ -962,6 +962,19 @@ print(f"{int(bs)} {cr}")
     _MTP_LEGAL=1
     (( _MTP_BLOCK % _CAP == 0 )) && _MTP_LEGAL=0
     info "MTP legality: k=$_K block $_MTP_BLOCK ring $_CAP ($_MTP_INTRO_SRC)"
+    # prefill-ttft B1: PREFILL_BLOCKS=N sets the prefill budget to N Mamba
+    # blocks, so every non-final chunk is a full block multiple. The align
+    # split rounds a chunk end down to the block, so a budget that is not a
+    # block multiple wastes the remainder (8192 at block 1728 runs 6912).
+    if [[ -n "${PREFILL_BLOCKS:-}" ]]; then
+        [[ "$PREFILL_BLOCKS" =~ ^[1-9][0-9]*$ ]] || err "PREFILL_BLOCKS must be a positive integer (got: '$PREFILL_BLOCKS')"
+        [[ "$_MTP_INTRO_SRC" == "formula" ]] || err "PREFILL_BLOCKS needs the files/mtp_block.py block (source: $_MTP_INTRO_SRC)"
+        MAX_NUM_BATCHED_TOKENS=$(( PREFILL_BLOCKS * _MTP_BLOCK ))
+        for _i in "${!VLLM_ARGS[@]}"; do
+            [[ "${VLLM_ARGS[$_i]}" == "--max-num-batched-tokens" ]] && VLLM_ARGS[_i + 1]=$MAX_NUM_BATCHED_TOKENS
+        done
+        info "PREFILL_BLOCKS=$PREFILL_BLOCKS: --max-num-batched-tokens $MAX_NUM_BATCHED_TOKENS (block $_MTP_BLOCK)"
+    fi
     if [[ "$_MTP_LEGAL" == "1" ]]; then
         err "MTP_NUM_SPECULATIVE_TOKENS=$_K is illegal for block ${_MTP_BLOCK}, compress ratio ${_MTP_CR} ($_MTP_INTRO_SRC): illegal k hard-fails the engine at config validation. Use a legal k (shipped default 3)."
     fi
