@@ -683,6 +683,8 @@ python3 "$SCRIPT_DIR/files/patch_ple_offload.py"
 for f in ple_offload_layer connector worker protocol; do
     [[ -f "$OFFLOAD_DIR/$f.py" ]] || err "offload patch missing: $f.py"
 done
+# PLE row I/O hook (files/ple_io): the gather and its optional trace.
+python3 "$SCRIPT_DIR/files/ple_io/patch_ple_io.py" || err "patch_ple_io.py failed"
 ok "Patches ready."
 
 # ---------------------------------------------------------------------------
@@ -1087,6 +1089,7 @@ docker run \\
     -v $OFFLOAD_DIR/connector.py:$VLLM_PKG/v1/ple_offload/connector.py:ro \\
     -v $OFFLOAD_DIR/worker.py:$VLLM_PKG/v1/ple_offload/worker.py:ro \\
     -v $OFFLOAD_DIR/protocol.py:$VLLM_PKG/v1/ple_offload/protocol.py:ro \\
+    -v $SCRIPT_DIR/files/ple_io/ple_io.py:$VLLM_PKG/v1/ple_offload/ple_io.py:ro \\
     -v $HF_CACHE_DIR:/root/.cache/huggingface \\
     -v $HOME/.cache/vllm:/root/.cache/vllm \\
     $EXTRA_DOCKER_ARGS \\
