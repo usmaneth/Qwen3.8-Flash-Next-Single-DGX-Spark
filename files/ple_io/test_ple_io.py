@@ -103,11 +103,15 @@ def main() -> int:
     cases = id_cases(rows, width, gen, args.rounds)
 
     fails = checks = 0
-    arms = [("fadvise", "c", 1), ("none", "c", 1), ("batch", "c", 1),
-            ("batch", "c", 4), ("batch", "pm", 1), ("batch", "pm", 4)]
-    for mode, backend, threads in arms:
+    # batch_min 0: every gather uses the backend. batch_min 4096: the small
+    # cases use the fadvise loop and the 131,072-row case uses the backend.
+    arms = [("fadvise", "c", 1, 0), ("none", "c", 1, 0), ("batch", "c", 1, 0),
+            ("batch", "c", 4, 0), ("batch", "pm", 1, 0), ("batch", "pm", 4, 0),
+            ("batch", "c", 4, 4096), ("batch", "pm", 8, 4096)]
+    for mode, backend, threads, bmin in arms:
         for tr in (False, True):
             ple_io.MODE, ple_io.BACKEND, ple_io.THREADS = mode, backend, threads
+            ple_io.BATCH_MIN = bmin
             ple_io.TRACE, ple_io.TRACE_RES = tr, (128 if tr else 0)
             err0 = ple_io._batch_errors
             for label, ids in cases:
@@ -128,28 +132,52 @@ def main() -> int:
                 fails += 1
                 print("FAIL the batch path is off")
 
+    # batch_min: a gather below it does not call the backend, one at or
+    # above it does.
+    calls = []
+    real_batch = ple_io._prefetch_batch
+    ple_io._prefetch_batch = lambda fd_, t_, i_: calls.append(i_.numel()) or real_batch(fd_, t_, i_)
+    ple_io.MODE, ple_io.BACKEND, ple_io.THREADS, ple_io.BATCH_MIN = "batch", "pm", 1, 4096
+    for tr in (False, True):
+        ple_io.TRACE, ple_io.TRACE_RES = tr, 0
+        for n in (112, 4095, 4096):
+            ids = torch.randint(0, rows, (n,), generator=gen, dtype=torch.int64)
+            out = torch.empty((n, width), dtype=torch.uint8)
+            ple_io.gather(fd, table, ids, out)
+            checks += 1
+            if not torch.equal(out, torch.index_select(ref_table, 0, ids)):
+                fails += 1
+                print(f"FAIL bytes batch_min case n={n} trace={tr}")
+    ple_io._prefetch_batch = real_batch
+    ple_io.TRACE = False
+    checks += 1
+    if calls != [4096, 4096]:
+        fails += 1
+        print("FAIL batch_min: backend calls", calls)
+
     # The ctl file: values, the id echo, an invalid value, a partial line.
     ctl = os.path.join(trace_dir, "ctl")
     with open(ctl, "w") as f:
-        f.write("mode=batch\nbackend=pm\nthreads=8\ndefer=1\nfast=1\ntrace=0\nres=0\nid=t1\n")
+        f.write("mode=batch\nbackend=pm\nthreads=8\nbatch_min=100\ndefer=1\nfast=1\ntrace=0\nres=0\nid=t1\n")
     ple_io._read_ctl()
-    got = (ple_io.MODE, ple_io.BACKEND, ple_io.THREADS, ple_io.DEFER, ple_io.FAST,
-           ple_io.TRACE, ple_io.TRACE_RES, ple_io.CTL_ID)
+    got = (ple_io.MODE, ple_io.BACKEND, ple_io.THREADS, ple_io.BATCH_MIN, ple_io.DEFER,
+           ple_io.FAST, ple_io.TRACE, ple_io.TRACE_RES, ple_io.CTL_ID)
     checks += 1
-    if got != ("batch", "pm", 8, 1, 1, False, 0, "t1"):
+    if got != ("batch", "pm", 8, 100, 1, 1, False, 0, "t1"):
         fails += 1
         print("FAIL ctl parse", got)
     with open(ctl, "w") as f:
         f.write("mode=bogus\nthreads=0\nid=t2\n")
     ple_io._read_ctl()
     checks += 1
-    if (ple_io.MODE, ple_io.THREADS, ple_io.DEFER) != ("fadvise", 4, 0):
+    want = (ple_io.DEFAULTS["mode"], int(ple_io.DEFAULTS["threads"]), int(ple_io.DEFAULTS["defer"]))
+    if (ple_io.MODE, ple_io.THREADS, ple_io.DEFER) != want:
         fails += 1
         print("FAIL ctl defaults", ple_io.MODE, ple_io.THREADS, ple_io.DEFER)
     with open(ctl, "w") as f:
         f.write("mode=batch")  # no newline: a partial write, not applied
     checks += 1
-    if ple_io._read_ctl() or ple_io.MODE != "fadvise":
+    if ple_io._read_ctl() or ple_io.MODE != ple_io.DEFAULTS["mode"]:
         fails += 1
         print("FAIL partial ctl applied")
     for t in ple_io._traces.values():

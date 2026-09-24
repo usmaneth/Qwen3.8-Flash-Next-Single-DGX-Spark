@@ -14,7 +14,9 @@ Modes (key ``mode``):
   fadvise  the shipped path: one posix_fadvise(WILLNEED) per unique 4 KiB
            page from a Python loop, then index_select.
   none     no prefetch: each missing page is a fault.
-  batch    one batched call for all pages (key ``backend``):
+  batch    one batched call for all pages (key ``backend``), for a gather
+           of at least ``batch_min`` rows. A smaller gather (a decode step)
+           uses the fadvise loop, the same code as mode=fadvise:
              c   ple_io_native.c: a byte-map dedup, then ``threads``
                  pthreads of posix_fadvise(WILLNEED) above 4096 pages.
              pm  process_madvise(MADV_WILLNEED) with iovec batches of 1024
@@ -26,6 +28,7 @@ Modes (key ``mode``):
 Control keys. The value order is: the ctl file (when VLLM_PLE_IO_TRACE_DIR
 is set) over the env VLLM_PLE_IO_<KEY> over the default.
   mode=fadvise|none|batch   backend=c|pm   threads=N (1-64)
+  batch_min=N               the smallest gather (rows) for mode=batch
   defer=0|1 (ple_io_defer)  fast=0|1 (ple_io_fast)
   check=0|1                 gate G3: digests of the rows on both sides
   trace=0|1                 per-gather, per-request and per-launch records
@@ -59,11 +62,13 @@ now = _now
 
 TRACE_DIR = os.environ.get("VLLM_PLE_IO_TRACE_DIR", "").strip()
 
-KEYS = ("mode", "backend", "threads", "defer", "fast", "check", "trace", "res")
+KEYS = ("mode", "backend", "threads", "batch_min", "defer", "fast", "check",
+        "trace", "res")
 DEFAULTS = {
     "mode": "fadvise",
     "backend": "c",
     "threads": "4",
+    "batch_min": "4096",
     "defer": "0",
     "fast": "0",
     "check": "0",
@@ -74,6 +79,7 @@ _VALID = {
     "mode": lambda v: v in ("fadvise", "none", "batch"),
     "backend": lambda v: v in ("c", "pm"),
     "threads": lambda v: v.isdigit() and 1 <= int(v) <= 64,
+    "batch_min": lambda v: v.isdigit(),
     "defer": lambda v: v in ("0", "1"),
     "fast": lambda v: v in ("0", "1"),
     "check": lambda v: v in ("0", "1"),
@@ -105,15 +111,16 @@ def ctl_get(key: str, default: str | None = None) -> str:
 
 # Hot-path copies of the keys. _apply() sets them.
 MODE = BACKEND = ""
-THREADS = DEFER = FAST = CHECK = TRACE_RES = 0
+THREADS = BATCH_MIN = DEFER = FAST = CHECK = TRACE_RES = 0
 TRACE = False
 
 
 def _apply() -> None:
-    global MODE, BACKEND, THREADS, DEFER, FAST, CHECK, TRACE, TRACE_RES
+    global MODE, BACKEND, THREADS, BATCH_MIN, DEFER, FAST, CHECK, TRACE, TRACE_RES
     MODE = ctl_get("mode")
     BACKEND = ctl_get("backend")
     THREADS = int(ctl_get("threads"))
+    BATCH_MIN = int(ctl_get("batch_min"))
     DEFER = int(ctl_get("defer"))
     FAST = int(ctl_get("fast"))
     CHECK = int(ctl_get("check")) if TRACE_DIR else 0
@@ -452,7 +459,7 @@ def prefetch(fd, table: torch.Tensor, ids: torch.Tensor) -> None:
     """Tell the kernel to read the pages of ``table[ids]`` (the current mode)."""
     if fd is None or MODE == "none" or not ids.numel():
         return
-    if MODE == "batch" and not _batch_off:
+    if MODE == "batch" and not _batch_off and ids.numel() >= BATCH_MIN:
         if _prefetch_batch(fd, table, ids) >= 0:
             return
     _advise_safe(fd, ids, table.shape[-1])
@@ -472,7 +479,8 @@ def gather(fd, table: torch.Tensor, ids: torch.Tensor,
     t0 = _now()
     pages = None
     npages = 0
-    if mode == "fadvise" or (mode == "batch" and _batch_off):
+    small = mode == "batch" and n < BATCH_MIN
+    if mode == "fadvise" or (mode == "batch" and (_batch_off or small)):
         pages = _pages(ids, row_width) if n else ids[:0]
         npages = pages.numel()
     t0b = _now()
@@ -493,7 +501,7 @@ def gather(fd, table: torch.Tensor, ids: torch.Tensor,
             except Exception:
                 pass
             if mode == "batch":
-                tag = "batch-off"
+                tag = "batch-small" if small and not _batch_off else "batch-off"
         elif mode == "batch":
             r = _prefetch_batch(fd, table, ids)
             if r < 0:
