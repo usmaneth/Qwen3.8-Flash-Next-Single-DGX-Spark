@@ -145,6 +145,7 @@ def _seq(it):
 @unittest.skipUnless(HAVE_VLLM, "needs the image (torch, safetensors, vllm)")
 class IteratorTests(unittest.TestCase):
     ENV = ("VLLM_ST_WINDOW", "VLLM_ST_WINDOW_METHOD", "VLLM_ST_WINDOW_THREADS",
+           "VLLM_ST_WINDOW_MODE", "VLLM_ST_BUFFER_PINNED",
            "VLLM_ST_WINDOW_FLOOR_GIB", "VLLM_ST_DROP_DONE", "VLLM_ST_SKIP_PLE_ONLY",
            "VLLM_ST_TRACE_DIR", "VLLM_PLE_CPU_OFFLOAD", "VLLM_PLE_PACKED_TABLE_DIR",
            "VLLM_MTP_FILE_GLOB")
@@ -220,6 +221,20 @@ class IteratorTests(unittest.TestCase):
                                            VLLM_ST_WINDOW_FLOOR_GIB=0)
                     self.assertEqual(got, want, (n, method, threads))
 
+    def test_buffer_mode(self):
+        want = self.stock(self.files)
+        for threads in (1, 4):
+            got = self.patched_seq(self.files, VLLM_ST_WINDOW=1, VLLM_ST_WINDOW_MODE="buffer",
+                                   VLLM_ST_WINDOW_THREADS=threads, VLLM_ST_WINDOW_FLOOR_GIB=0)
+            self.assertEqual(got, want, threads)
+        got = self.patched_seq(self.files, VLLM_ST_WINDOW=1, VLLM_ST_WINDOW_MODE="buffer",
+                               VLLM_ST_SKIP_PLE_ONLY=1, VLLM_PLE_CPU_OFFLOAD=1,
+                               VLLM_PLE_PACKED_TABLE_DIR="/x", VLLM_ST_WINDOW_FLOOR_GIB=0)
+        drop = set()
+        for f in self.ple_only:
+            drop |= {n for n, *_ in self.stock([f])}
+        self.assertEqual(got, [x for x in want if x[0] not in drop])
+
     def test_skip_ple_only(self):
         want = [x for x in self.stock(self.files)]
         drop = set()
@@ -256,8 +271,12 @@ class IteratorTests(unittest.TestCase):
                                VLLM_ST_WINDOW_FLOOR_GIB=0)
         t2 = time.time()
         self.assertEqual(got, want)
-        print(f"\nT1 real: {len(want)} tensors, stock {t1 - t0:.1f}s, window {t2 - t1:.1f}s",
-              file=sys.stderr)
+        got_b = self.patched_seq(files, VLLM_ST_WINDOW=1, VLLM_ST_WINDOW_MODE="buffer",
+                                 VLLM_ST_WINDOW_THREADS=4, VLLM_ST_WINDOW_FLOOR_GIB=0)
+        t3 = time.time()
+        self.assertEqual(got_b, want)
+        print(f"\nT1 real: {len(want)} tensors, stock {t1 - t0:.1f}s, window {t2 - t1:.1f}s, "
+              f"buffer {t3 - t2:.1f}s", file=sys.stderr)
 
 
 # ------------------------------------------------------------------------- T4

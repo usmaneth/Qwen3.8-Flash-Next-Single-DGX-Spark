@@ -28,6 +28,10 @@ names (the offload worker serves them from the packed table).
 Knobs (container env). With every knob off, the stock statements run:
   VLLM_ST_WINDOW=N              files ahead of the consumer (0 = off)
   VLLM_ST_WINDOW_METHOD         read (default) or willneed
+  VLLM_ST_WINDOW_MODE           cache (default, R3) or buffer (R3b: O_DIRECT
+                                read of file i into one host buffer, and views
+                                of it in the stock name order)
+  VLLM_ST_BUFFER_PINNED=1       R3b buffer in pinned host memory
   VLLM_ST_WINDOW_THREADS        reader threads for each file (default 1)
   VLLM_ST_WINDOW_FLOOR_GIB      pause reads while MemAvailable is below (16)
   VLLM_ST_DROP_DONE=1           drop a consumed file from the page cache
@@ -79,7 +83,10 @@ NEW_LAZY = '''        else:
                 for name in f.keys():  # noqa: SIM118
                     if should_skip_weight(name, local_expert_ids):
                         continue
-                    param = f.get_tensor(name)
+                    if _bf_win is not None and _bf_win.buffer is not None:
+                        param = _bf_win.tensor(f, name)
+                    else:
+                        param = f.get_tensor(name)
                     if _bf_trace is not None:
                         _bf_trace.record(name, param)
                     yield name, param
@@ -144,6 +151,15 @@ class _BootFastWindow:
         self.threads = max(1, int(os.environ.get("VLLM_ST_WINDOW_THREADS", "1") or 1))
         self.floor = float(os.environ.get("VLLM_ST_WINDOW_FLOOR_GIB", "16") or 16)
         self.drop = os.environ.get("VLLM_ST_DROP_DONE", "0") == "1"
+        # cache: read into the page cache ahead (R3). buffer: O_DIRECT read of
+        # file i into one host buffer, then views in the stock order (R3b).
+        self.mode = os.environ.get("VLLM_ST_WINDOW_MODE", "cache")
+        self.pinned = os.environ.get("VLLM_ST_BUFFER_PINNED", "0") == "1"
+        self.buffer = None
+        self.buf_hdr = {}
+        self.buf_start = 0
+        self.buf_alive = 0
+        self._last_buf = None
         keep_glob = os.environ.get("VLLM_MTP_FILE_GLOB", "")
         self.skipped = set()
         if (
@@ -181,6 +197,9 @@ class _BootFastWindow:
         self.thread = threading.Thread(
             target=self._run, name="bootfast-window", daemon=True
         )
+        if self.mode == "buffer":
+            for ev in self.events:
+                ev.set()
         logger.info(
             "boot-fast window: %d files, %d skipped, window %d, method %s, "
             "threads %d, floor %.1f GiB, drop %s, keep %s",
@@ -193,7 +212,74 @@ class _BootFastWindow:
             self.drop,
             sorted(os.path.basename(f) for f in self.keep),
         )
-        self.thread.start()
+        if self.mode != "buffer":
+            self.thread.start()
+
+    # buffer mode (R3b) -------------------------------------------------
+    _DTYPES = {
+        "F64": torch.float64, "F32": torch.float32, "F16": torch.float16,
+        "BF16": torch.bfloat16, "I64": torch.int64, "I32": torch.int32,
+        "I16": torch.int16, "I8": torch.int8, "U8": torch.uint8, "BOOL": torch.bool,
+        "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2,
+    }
+
+    def _read_buffer(self, path):
+        import ctypes
+
+        size = os.path.getsize(path)
+        alloc = -(-size // 4096) * 4096
+        raw = torch.empty(alloc + 4096, dtype=torch.uint8, pin_memory=self.pinned)
+        pad = (-raw.data_ptr()) % 4096
+        buf = raw[pad : pad + alloc]
+        base = buf.data_ptr()
+        threads = max(1, self.threads)
+        part = -(-alloc // threads)
+        part = -(-part // self.CHUNK) * self.CHUNK
+        errors = []
+
+        def work(start, end):
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+            except OSError:
+                fd = os.open(path, os.O_RDONLY)
+            try:
+                off = start
+                while off < end:
+                    n = min(self.CHUNK, end - off)
+                    mv = memoryview((ctypes.c_char * n).from_address(base + off)).cast("B")
+                    got = os.preadv(fd, [mv], off)
+                    if got <= 0:
+                        break
+                    off += got
+            except OSError as exc:
+                errors.append(exc)
+            finally:
+                os.close(fd)
+
+        ths = [
+            threading.Thread(target=work, args=(s0, min(s0 + part, alloc)), daemon=True)
+            for s0 in range(0, alloc, part)
+        ]
+        for t in ths:
+            t.start()
+        for t in ths:
+            t.join()
+        if errors:
+            raise errors[0]
+        return raw, buf, size
+
+    def tensor(self, f, name):
+        """A view of the buffer with the bytes of `name`; get_tensor if not possible."""
+        meta = self.buf_hdr.get(name)
+        dtype = self._DTYPES.get(meta["dtype"]) if meta else None
+        if dtype is None:
+            return f.get_tensor(name)
+        a, b = meta["data_offsets"]
+        raw = self.buffer[self.buf_start + a : self.buf_start + b]
+        try:
+            return raw.view(dtype).reshape(meta["shape"])
+        except RuntimeError:
+            return f.get_tensor(name)
 
     # reader thread -----------------------------------------------------
     def _read_range(self, path, start, end):
@@ -274,6 +360,27 @@ class _BootFastWindow:
 
     def wait(self, path):
         i = self.index[path]
+        if self.mode == "buffer":
+            import weakref
+
+            t0 = time.perf_counter()
+            if self._last_buf is not None and self._last_buf() is not None:
+                self.buf_alive += 1
+            try:
+                raw, buf, size = self._read_buffer(path)
+                self.buf_hdr = _bf_header(path)
+                self.buf_start = self.buf_hdr["__data_start__"]
+                self.buffer = buf
+                self._last_buf = weakref.ref(raw)
+                self.tot_bytes += size
+            except Exception:
+                logger.exception("boot-fast window: buffer read of %s failed; get_tensor", path)
+                self.buffer = None
+            self.read_s[i] = time.perf_counter() - t0
+            self.t_wait[i] = self.read_s[i]
+            self.t_begin[i] = time.perf_counter()
+            self.tot_wait += self.read_s[i]
+            return
         with self.cond:
             self.consumer = i
             self.cond.notify_all()
@@ -287,6 +394,8 @@ class _BootFastWindow:
     def done(self, path):
         i = self.index[path]
         consume = time.perf_counter() - self.t_begin.get(i, time.perf_counter())
+        self.buffer = None
+        self.buf_hdr = {}
         dropped = False
         if self.drop and path not in self.keep:
             try:
@@ -317,11 +426,13 @@ class _BootFastWindow:
             total = time.perf_counter() - self.t_start
             logger.info(
                 "boot-fast window: done, %d files, %.2f GiB read in %.1fs, "
-                "consumer waited %.1fs",
+                "consumer waited %.1fs (mode %s, buffers still referenced %d)",
                 len(self.order),
                 self.tot_bytes / 2**30,
                 total,
                 self.tot_wait,
+                self.mode,
+                self.buf_alive,
             )
 
 
