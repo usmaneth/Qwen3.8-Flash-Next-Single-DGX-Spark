@@ -56,6 +56,7 @@ import collections
 import dataclasses
 import importlib
 import json
+import os
 import statistics
 import sys
 import time
@@ -299,6 +300,12 @@ class KDExt:
                 raise RuntimeError("mtp_w8: needs VLLM_MTP_DENSE_W8A16=1 at launch")
             mod._ON = bool(knobs["mtp_w8"])
             done["mtp_w8"] = mod._ON
+        if "mtp_norm" in knobs:
+            mod = sys.modules.get("vllm.models.qwen3_8_flash_next.nvidia.mtp_w8a16")
+            if mod is None or os.environ.get("VLLM_MTP_FUSED_NORM", "0") != "1":
+                raise RuntimeError("mtp_norm: needs VLLM_MTP_FUSED_NORM=1 at launch")
+            mod._NORM_ON = bool(knobs["mtp_norm"])
+            done["mtp_norm"] = mod._NORM_ON
         if "mtp_w4" in knobs:
             mod = sys.modules.get("vllm.models.qwen3_8_flash_next.nvidia.mtp_w8a16")
             if mod is None or not mod._BUILD_W4:

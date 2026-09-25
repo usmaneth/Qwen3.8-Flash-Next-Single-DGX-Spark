@@ -127,6 +127,53 @@ if triton is not None:
         tl.store(O + idx, (acc * sc).to(tl.bfloat16), mask)
 
 
+if triton is not None:
+
+    @triton.jit
+    def _gemma_rmsnorm_kernel(X, W, Y, N, stride, eps, BLOCK: tl.constexpr):
+        row = tl.program_id(0)
+        offs = tl.arange(0, BLOCK)
+        m = offs < N
+        x = tl.load(X + row * stride + offs, m, other=0.0).to(tl.float32)
+        var = tl.sum(x * x, axis=0) / N
+        w = tl.load(W + offs, m, other=0.0).to(tl.float32) + 1.0
+        y = (x * tl.math.rsqrt(var + eps)) * w
+        tl.store(Y + row * N + offs, y.to(tl.bfloat16), m)
+
+
+# R14 part: the two GemmaRMSNorms of the MTP input (pre_fc_norm_embedding,
+# pre_fc_norm_hidden) run as about 10 torch kernels each per pass (the
+# weight + 1 in FP32, then the native RMS norm). VLLM_MTP_FUSED_NORM=1 runs
+# one Triton kernel: FP32 sum of squares (another order than torch), the
+# same FP32 ops, one BF16 rounding. Draft-only.
+NORM_ENV = "VLLM_MTP_FUSED_NORM"
+_NORM_ON = os.environ.get(NORM_ENV, "0") == "1"
+
+
+def gemma_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    shape = x.shape
+    x2 = x.reshape(-1, shape[-1])
+    if x2.stride(1) != 1:
+        x2 = x2.contiguous()
+    n = x2.shape[1]
+    y = torch.empty((x2.shape[0], n), dtype=torch.bfloat16, device=x.device)
+    _gemma_rmsnorm_kernel[(x2.shape[0],)](x2, weight, y, n, x2.stride(0), eps,
+                                          BLOCK=triton.next_power_of_2(n), num_warps=8)
+    return y.reshape(shape)
+
+
+def _wrap_norm(mod) -> None:
+    orig = mod.forward
+
+    def forward(x, residual=None, _orig=orig, _mod=mod):
+        if (not _NORM_ON or residual is not None or x.dtype != torch.bfloat16 or not x.is_cuda
+                or x.numel() // x.shape[-1] > MAX_M * 4):
+            return _orig(x, residual) if residual is not None else _orig(x)
+        return gemma_rmsnorm(x, _mod.weight, _mod.variance_epsilon)
+
+    mod.forward = forward
+
+
 def w8a16_linear(x: torch.Tensor, w8: torch.Tensor, scale: torch.Tensor,
                  tile=None) -> torch.Tensor:
     """y[M, N] = x[M, K] @ (w8 * scale)^T in FP32, rounded once to BF16."""
@@ -242,6 +289,12 @@ def enable_mtp_w8a16(model: torch.nn.Module, logger=None) -> list:
             continue
         mod.quant_method = MtpW8A16Method(qm, name)
         names.append(f"{name}{tuple(w.shape)}")
+    if os.environ.get(NORM_ENV, "0") == "1":
+        inner = getattr(model, "model", model)
+        for nm in ("pre_fc_norm_embedding", "pre_fc_norm_hidden"):
+            if hasattr(inner, nm):
+                _wrap_norm(getattr(inner, nm))
+                names.append(nm)
     if logger is not None:
         logger.info("MTP W8A16: %d dense linears get FP8 row-scaled copies: %s",
                     len(names), ", ".join(names))

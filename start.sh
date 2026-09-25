@@ -120,7 +120,7 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S API_KEY
                     VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
                     MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE
-                    KERN_DECODE KERN_RPC LM_HEAD_FP8_RESCORE SHORTCONV_ASYNC_H2D MTP_DENSE_W8A16 PLE_GPU_WAIT MTP_DENSE_W4A16 MTP_DRAFT_HEAD_W4 KERN_SKINNY)
+                    KERN_DECODE KERN_RPC LM_HEAD_FP8_RESCORE SHORTCONV_ASYNC_H2D MTP_DENSE_W8A16 PLE_GPU_WAIT MTP_DENSE_W4A16 MTP_DRAFT_HEAD_W4 KERN_SKINNY MTP_FUSED_NORM)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAP_$_v=\${$_v-}"
     eval "_SNAPSET_$_v=\${$_v+set}"
@@ -341,6 +341,9 @@ PLE_GPU_WAIT="${PLE_GPU_WAIT:-0}"
 # R17: MTP_DENSE_W4A16=1 (with MTP_DENSE_W8A16=1) also builds 4-bit drafter
 # copies (files/kern/w4a16.py) and uses them (kd_ext knob mtp_w4).
 MTP_DENSE_W4A16="${MTP_DENSE_W4A16:-0}"
+# R14 part: MTP_FUSED_NORM=1 (with MTP_DENSE_W8A16=1) runs the two MTP input
+# GemmaRMSNorms as one Triton kernel each.
+MTP_FUSED_NORM="${MTP_FUSED_NORM:-0}"
 # R8: MTP_DRAFT_HEAD_W4=1 adds a 4-bit copy of the reduced draft head.
 MTP_DRAFT_HEAD_W4="${MTP_DRAFT_HEAD_W4:-0}"
 # R6: KERN_SKINNY=1 routes the router, GDN ba and HC linears of the target
@@ -718,6 +721,7 @@ if [[ "$KERN_DECODE" == 1 ]]; then
     [[ "$MTP_DENSE_W8A16" == 1 ]] && KERN_MOUNTS+=" -e VLLM_MTP_DENSE_W8A16=1"
     KERN_MOUNTS+=" -v $KERN_DIR/out/w4a16.py:$VLLM_PKG/models/qwen3_8_flash_next/nvidia/w4a16.py:ro"
     [[ "$MTP_DENSE_W4A16" == 1 ]] && KERN_MOUNTS+=" -e VLLM_MTP_DENSE_W4A16=1"
+    [[ "$MTP_FUSED_NORM" == 1 ]] && KERN_MOUNTS+=" -e VLLM_MTP_FUSED_NORM=1"
     [[ "$MTP_DRAFT_HEAD_W4" == 1 ]] && KERN_MOUNTS+=" -e VLLM_MTP_DRAFT_HEAD_W4=1"
     KERN_MOUNTS+=" -v $KERN_DIR/out/skinny_bf16.py:$VLLM_PKG/models/qwen3_8_flash_next/nvidia/skinny_bf16.py:ro"
     [[ "$KERN_SKINNY" == 1 ]] && KERN_MOUNTS+=" -e VLLM_KERN_SKINNY=1"
