@@ -123,7 +123,7 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     BOOT_FAST BOOT_FAST_WINDOW BOOT_FAST_WINDOW_FILES BOOT_FAST_WINDOW_METHOD
                     BOOT_FAST_WINDOW_THREADS BOOT_FAST_WINDOW_FLOOR_GIB BOOT_FAST_WINDOW_MODE BOOT_FAST_BUFFER_PINNED BOOT_FAST_EXPERT_LOOKUP
                     BOOT_FAST_MTP_FILES BOOT_FAST_PLE_FILES BOOT_FAST_SKIP_MM_WARMUP
-                    BOOT_FAST_MTP_ALLOW BOOT_HASH BOOT_HASH_DIR BOOT_TRACE BOOT_TRACE_DIR)
+                    BOOT_FAST_MTP_ALLOW BOOT_FAST_PREFLIGHT_CACHE BOOT_HASH BOOT_HASH_DIR BOOT_TRACE BOOT_TRACE_DIR)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAP_$_v=\${$_v-}"
     eval "_SNAPSET_$_v=\${$_v+set}"
@@ -845,8 +845,9 @@ print(" ".join(sorted(algos)))
 PY
 )
     if [[ -n "$_QALGO" ]]; then
-        _DISPATCH=$(docker run --rm --entrypoint python3 \
-            -v "$MODEL_PATH/$SNAPSHOT_REL:/m:ro" "$IMAGE" -c '
+        # The probe script. boot-fast R11 caches its output, keyed on the image
+        # (Id and RepoDigests), config.json, hf_quant_config.json and this text.
+        _QPROBE='
 import json, pathlib, sys
 cfg = json.loads(pathlib.Path("/m/config.json").read_text())
 qc = cfg.get("quantization_config")
@@ -871,7 +872,27 @@ try:
 except Exception as e:
     print(json.dumps({"declared": declared, "error": str(e)[:200]}, default=str))
     sys.exit(3)
-' 2>/dev/null || echo "")
+'
+        _QCACHE=""
+        if [[ "${BOOT_FAST_PREFLIGHT_CACHE:-${BOOT_FAST:-0}}" == "1" ]]; then
+            _QKEY=$( { docker image inspect "$IMAGE" --format '{{.Id}} {{json .RepoDigests}}'
+                       cat "$MODEL_PATH/$SNAPSHOT_REL/config.json"
+                       cat "$MODEL_PATH/$SNAPSHOT_REL/hf_quant_config.json" 2>/dev/null || true
+                       printf '%s' "$_QPROBE"; } | sha256sum | cut -c1-32)
+            _QCACHE="$HOME/.cache/vllm/boot-fast/preflight-$_QKEY.json"
+        fi
+        if [[ -n "$_QCACHE" && -s "$_QCACHE" ]]; then
+            _DISPATCH=$(cat "$_QCACHE")
+            info "quant_algo pre-flight: cached result $(basename "$_QCACHE") (R11)"
+        else
+            _DISPATCH=$(docker run --rm --entrypoint python3 \
+                -v "$MODEL_PATH/$SNAPSHOT_REL:/m:ro" "$IMAGE" -c "$_QPROBE" 2>/dev/null || echo "")
+            # Only a clean result is cached: an error or an empty result runs the probe again next time.
+            if [[ -n "$_QCACHE" && -n "$_DISPATCH" && "$_DISPATCH" != *'"error"'* ]]; then
+                mkdir -p "$(dirname "$_QCACHE")"
+                printf '%s\n' "$_DISPATCH" > "$_QCACHE.tmp" && mv "$_QCACHE.tmp" "$_QCACHE"
+            fi
+        fi
         if [[ -z "$_DISPATCH" ]]; then
             warn "quant_algo pre-flight: image introspection failed (offline / older image); skipping."
             warn "     Checkpoint declares quant_algo: $_QALGO"
