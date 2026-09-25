@@ -255,6 +255,7 @@ class KDExt:
         info["ple_gpu_wait"] = getattr(con, "_GPU_WAIT_ON", None) if getattr(con, "_GPU_WAIT", False) else None
         w8 = sys.modules.get("vllm.models.qwen3_8_flash_next.nvidia.mtp_w8a16")
         info["mtp_w8"] = getattr(w8, "_ON", None)
+        info["mtp_w4"] = getattr(w8, "_W4_ON", None) if getattr(w8, "_BUILD_W4", False) else None
         return info
 
     def kd_set(self, spec_json):
@@ -298,6 +299,12 @@ class KDExt:
                 raise RuntimeError("mtp_w8: needs VLLM_MTP_DENSE_W8A16=1 at launch")
             mod._ON = bool(knobs["mtp_w8"])
             done["mtp_w8"] = mod._ON
+        if "mtp_w4" in knobs:
+            mod = sys.modules.get("vllm.models.qwen3_8_flash_next.nvidia.mtp_w8a16")
+            if mod is None or not mod._BUILD_W4:
+                raise RuntimeError("mtp_w4: needs VLLM_MTP_DENSE_W4A16=1 at launch")
+            mod._W4_ON = bool(knobs["mtp_w4"])
+            done["mtp_w4"] = mod._W4_ON
         for key, val in (knobs.get("attr") or {}).items():
             mname, aname = key.split(":")
             mod = importlib.import_module(mname)

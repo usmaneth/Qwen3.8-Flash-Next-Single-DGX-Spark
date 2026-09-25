@@ -45,6 +45,11 @@ except ImportError:  # pragma: no cover
 
 ENV = "VLLM_MTP_DENSE_W8A16"
 _ON = os.environ.get(ENV, "0") == "1"
+# R17: VLLM_MTP_DENSE_W4A16=1 also builds a 4-bit copy (w4a16.py, 0.53 bytes
+# per weight). _W4_ON picks it over the FP8 copy (kd_ext knob mtp_w4).
+ENV4 = "VLLM_MTP_DENSE_W4A16"
+_BUILD_W4 = os.environ.get(ENV4, "0") == "1"
+_W4_ON = _BUILD_W4
 MAX_M = 32
 FP8 = torch.float8_e4m3fn
 FP8_MAX = 448.0
@@ -165,6 +170,7 @@ class MtpW8A16Method(_Base):
         self.name = name
         self.w8 = None
         self.scale = None
+        self.w4 = None
 
     def create_weights(self, *args, **kwargs):
         return self.inner.create_weights(*args, **kwargs)
@@ -179,6 +185,10 @@ class MtpW8A16Method(_Base):
         if w is None or w.dim() != 2 or w.dtype != torch.bfloat16 or w.device.type != "cuda":
             return
         self.w8, self.scale = quantize_rows(w.data)
+        if _BUILD_W4 and w.shape[1] % 32 == 0:
+            from .w4a16 import quantize_w4
+
+            self.w4 = quantize_w4(w.data)
 
     def apply(self, layer, x: torch.Tensor, bias=None):
         if not _ON or self.w8 is None or bias is not None or x.dtype != torch.bfloat16:
@@ -187,6 +197,10 @@ class MtpW8A16Method(_Base):
         x2 = x.reshape(-1, x.shape[-1])
         if x2.shape[0] == 0 or x2.shape[0] > MAX_M:
             return self.inner.apply(layer, x, bias)
+        if _W4_ON and self.w4 is not None:
+            from .w4a16 import w4a16_linear
+
+            return w4a16_linear(x2, *self.w4).reshape(*lead, self.w8.shape[0])
         return w8a16_linear(x2, self.w8, self.scale).reshape(*lead, self.w8.shape[0])
 
 
