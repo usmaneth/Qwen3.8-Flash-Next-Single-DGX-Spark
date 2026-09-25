@@ -132,6 +132,193 @@ class GlobTests(unittest.TestCase):
         globs.check_glob(gp, ple, on_disk)
 
 
+# ------------------------------------------------------------------------- T1
+def _seq(it):
+    import torch
+    out = []
+    for name, t in it:
+        b = t.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes() if t.numel() else b""
+        out.append((name, str(t.dtype), tuple(t.shape), hashlib.blake2b(b, digest_size=16).hexdigest()))
+    return out
+
+
+@unittest.skipUnless(HAVE_VLLM, "needs the image (torch, safetensors, vllm)")
+class IteratorTests(unittest.TestCase):
+    ENV = ("VLLM_ST_WINDOW", "VLLM_ST_WINDOW_METHOD", "VLLM_ST_WINDOW_THREADS",
+           "VLLM_ST_WINDOW_FLOOR_GIB", "VLLM_ST_DROP_DONE", "VLLM_ST_SKIP_PLE_ONLY",
+           "VLLM_ST_TRACE_DIR", "VLLM_PLE_CPU_OFFLOAD", "VLLM_PLE_PACKED_TABLE_DIR",
+           "VLLM_MTP_FILE_GLOB")
+
+    @classmethod
+    def setUpClass(cls):
+        import torch
+        from safetensors.torch import save_file
+        import vllm.model_executor.model_loader.weight_utils as orig
+        cls.orig = orig
+        cls.patched = load_file_module("bf_weight_utils", OURS / "weight_utils.py")
+        cls.tmp = tempfile.TemporaryDirectory()
+        g = torch.Generator().manual_seed(7)
+        cls.files, cls.ple_only = [], []
+        for i in range(1, 8):
+            tensors = {}
+            if i in (2, 3):
+                for s in range(4):
+                    p = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+                    tensors[f"{p}.shard_{s}.weight"] = torch.randint(0, 255, (64, 16), dtype=torch.uint8, generator=g)
+                    tensors[f"{p}.shard_{s}.weight_scale"] = torch.rand(64, 1, generator=g).to(torch.float8_e4m3fn)
+            else:
+                for e in (0, 1, 11, 111, 511):
+                    base = f"model.language_model.layers.{i}.mlp.experts.{e}"
+                    tensors[f"{base}.down_proj.weight"] = torch.randint(0, 255, (32, 24), dtype=torch.uint8, generator=g)
+                    tensors[f"{base}.down_proj.weight_scale"] = torch.rand(32, 3, generator=g).to(torch.float8_e4m3fn)
+                    tensors[f"{base}.down_proj.weight_scale_2"] = torch.rand((), generator=g)
+                    tensors[f"{base}.gate_proj.weight"] = torch.randint(0, 255, (48, 24), dtype=torch.uint8, generator=g)
+                tensors[f"model.language_model.layers.{i}.input_layernorm.weight"] = torch.rand(40, generator=g).to(torch.bfloat16)
+                tensors[f"model.language_model.layers.{i}.big"] = torch.rand(300_000, generator=g)
+                if i == 1:
+                    tensors["model.language_model.layers.1.ple.ple_embedding.layer_multipliers"] = torch.rand(3, generator=g)
+            path = os.path.join(cls.tmp.name, f"model-{i:05d}-of-00007.safetensors")
+            save_file(tensors, path)
+            cls.files.append(path)
+            if i in (2, 3):
+                cls.ple_only.append(path)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def setUp(self):
+        self.saved = {k: os.environ.pop(k, None) for k in self.ENV}
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+    def stock(self, files):
+        return _seq(self.orig.safetensors_weights_iterator(files, False, "lazy"))
+
+    def patched_seq(self, files, **env):
+        os.environ.update({k: str(v) for k, v in env.items()})
+        try:
+            return _seq(self.patched.safetensors_weights_iterator(files, False, "lazy"))
+        finally:
+            for k in env:
+                os.environ.pop(k, None)
+
+    def test_knobs_off(self):
+        self.assertEqual(self.patched_seq(self.files), self.stock(self.files))
+
+    def test_window(self):
+        want = self.stock(self.files)
+        for n in (1, 2, 9):
+            for method in ("read", "willneed"):
+                for threads in (1, 3):
+                    got = self.patched_seq(self.files, VLLM_ST_WINDOW=n, VLLM_ST_WINDOW_METHOD=method,
+                                           VLLM_ST_WINDOW_THREADS=threads, VLLM_ST_DROP_DONE=1,
+                                           VLLM_ST_WINDOW_FLOOR_GIB=0)
+                    self.assertEqual(got, want, (n, method, threads))
+
+    def test_skip_ple_only(self):
+        want = [x for x in self.stock(self.files)]
+        drop = set()
+        for f in self.ple_only:
+            drop |= {n for n, *_ in self.stock([f])}
+        want = [x for x in want if x[0] not in drop]
+        got = self.patched_seq(self.files, VLLM_ST_WINDOW=1, VLLM_ST_SKIP_PLE_ONLY=1,
+                               VLLM_PLE_CPU_OFFLOAD=1, VLLM_PLE_PACKED_TABLE_DIR="/x",
+                               VLLM_ST_WINDOW_FLOOR_GIB=0)
+        self.assertEqual(got, want)
+        self.assertTrue(drop)
+        # Without the offload knobs, the skip does not engage.
+        got = self.patched_seq(self.files, VLLM_ST_WINDOW=1, VLLM_ST_SKIP_PLE_ONLY=1,
+                               VLLM_ST_WINDOW_FLOOR_GIB=0)
+        self.assertEqual(got, self.stock(self.files))
+
+    def test_trace(self):
+        with tempfile.TemporaryDirectory() as d:
+            got = self.patched_seq(self.files, VLLM_ST_TRACE_DIR=d)
+            self.assertEqual(got, self.stock(self.files))
+            traces = sorted(Path(d).glob("trace-gpu-*.tsv"))
+            self.assertEqual(len(traces), 1)
+            rows = [ln.split("\t") for ln in traces[0].read_text().splitlines()]
+            self.assertEqual([r[1] for r in rows], [x[0] for x in got])
+            self.assertTrue(all(r[4].isdigit() and r[5].isdigit() for r in rows))
+
+    @unittest.skipUnless(os.environ.get("BF_T1_REAL"), "BF_T1_REAL not set (L0 only)")
+    def test_real_shards(self):
+        files = os.environ["BF_T1_REAL"].split()
+        t0 = time.time()
+        want = self.stock(files)
+        t1 = time.time()
+        got = self.patched_seq(files, VLLM_ST_WINDOW=1, VLLM_ST_DROP_DONE=0,
+                               VLLM_ST_WINDOW_FLOOR_GIB=0)
+        t2 = time.time()
+        self.assertEqual(got, want)
+        print(f"\nT1 real: {len(want)} tensors, stock {t1 - t0:.1f}s, window {t2 - t1:.1f}s",
+              file=sys.stderr)
+
+
+# ------------------------------------------------------------ patch structure
+def _top(path):
+    return {getattr(n, "name", None): n for n in ast.parse(Path(path).read_text()).body
+            if isinstance(n, (ast.FunctionDef, ast.ClassDef, ast.AsyncFunctionDef))}
+
+
+class PatchStructureTests(unittest.TestCase):
+    """Each generated file changes only the functions that its patch names.
+
+    Every other top-level function and class, and every other method of a
+    changed class, has the same AST (decorators too) as the image file. The
+    new _bf_ helpers have no decorator.
+    """
+    CHANGED = {
+        "weight_utils.py": {"safetensors_weights_iterator": None},
+        "routed_experts.py": {"RoutedExperts": {"load_weights"}},
+        "model_runner.py": {"GPUModelRunner": {"load_model"}},
+        "base.py": {"BaseRenderer": {"warmup"}},
+    }
+
+    def compare(self, fname):
+        new_p, old_p = OURS / fname, OURS / (fname + ".orig")
+        if not (new_p.is_file() and old_p.is_file()):
+            self.skipTest(f"{fname} not generated (start.sh makes it)")
+        new, old = _top(new_p), _top(old_p)
+        changed = self.CHANGED[fname]
+        for name, node in old.items():
+            self.assertIn(name, new, name)
+            if name not in changed:
+                self.assertEqual(ast.dump(node), ast.dump(new[name]), f"{fname}: {name} changed")
+                continue
+            self.assertEqual([ast.dump(d) for d in node.decorator_list],
+                             [ast.dump(d) for d in new[name].decorator_list], name)
+            methods = changed[name]
+            if methods is None:
+                continue
+            om = {m.name: m for m in node.body if isinstance(m, ast.FunctionDef)}
+            nm = {m.name: m for m in new[name].body if isinstance(m, ast.FunctionDef)}
+            self.assertEqual(set(om), set(nm), name)
+            for m in om:
+                if m not in methods:
+                    self.assertEqual(ast.dump(om[m]), ast.dump(nm[m]), f"{fname}: {name}.{m} changed")
+        for name, node in new.items():
+            if name not in old:
+                self.assertTrue(name.startswith(("_bf_", "_BootFast")), f"{fname}: new {name}")
+                self.assertEqual(node.decorator_list, [], f"{fname}: {name} is decorated")
+
+    def test_weight_utils(self):
+        self.compare("weight_utils.py")
+
+    def test_routed_experts(self):
+        self.compare("routed_experts.py")
+
+    def test_model_runner(self):
+        self.compare("model_runner.py")
+
+    def test_base(self):
+        self.compare("base.py")
+
 
 if __name__ == "__main__":
     unittest.main()

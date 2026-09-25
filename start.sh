@@ -730,6 +730,27 @@ if [[ "$BOOT_FAST_WINDOW$BOOT_FAST_MTP_FILES$BOOT_FAST_PLE_FILES$BOOT_FAST_EXPER
         --mtp-source "$PATCHED_MTP" 2>/dev/null || true)
     BF_MTP_GLOB=$(printf '%s\n' "$_BF_OUT" | sed -n 's/^MTP_GLOB=//p')
     BF_PLE_GLOB=$(printf '%s\n' "$_BF_OUT" | sed -n 's/^PLE_GLOB=//p')
+    if [[ "$BOOT_FAST_WINDOW" == "1" || "$BOOT_TRACE" == "1" ]]; then
+        extract "$VLLM_PKG/model_executor/model_loader/weight_utils.py" "$OURS/weight_utils.py.orig"
+        python3 "$OURS/patch_weight_utils_window.py" >/dev/null || err "patch_weight_utils_window.py failed"
+        _bf_mount "$OURS/weight_utils.py" model_executor/model_loader/weight_utils.py
+    fi
+    if [[ "$BOOT_FAST_WINDOW" == "1" ]]; then
+        # The window reads ahead every file that the iterator opens. Without
+        # the drafter filter it would read all 35 files again in pass 2.
+        if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 && ( "$BOOT_FAST_MTP_FILES" != "1" || -z "$BF_MTP_GLOB" ) ]]; then
+            err "BOOT_FAST_WINDOW=1 needs BOOT_FAST_MTP_FILES=1 and an MTP glob while MTP is on."
+        fi
+        BF_DOCKER_ARGS+=" -e VLLM_ST_WINDOW=$BOOT_FAST_WINDOW_FILES -e VLLM_ST_WINDOW_METHOD=$BOOT_FAST_WINDOW_METHOD"
+        BF_DOCKER_ARGS+=" -e VLLM_ST_WINDOW_THREADS=$BOOT_FAST_WINDOW_THREADS -e VLLM_ST_WINDOW_FLOOR_GIB=$BOOT_FAST_WINDOW_FLOOR_GIB"
+        BF_DOCKER_ARGS+=" -e VLLM_ST_DROP_DONE=1 -e VLLM_ST_SKIP_PLE_ONLY=1"
+        info "  R3+R5 window: $BOOT_FAST_WINDOW_FILES file(s) ahead, $BOOT_FAST_WINDOW_METHOD x$BOOT_FAST_WINDOW_THREADS, PLE-only files skipped"
+    fi
+    if [[ "$BOOT_TRACE" == "1" ]]; then
+        mkdir -p "$BOOT_TRACE_DIR"
+        BF_DOCKER_ARGS+=" -v $BOOT_TRACE_DIR:/root/boot-trace -e VLLM_ST_TRACE_DIR=/root/boot-trace"
+        info "  G2 loader trace: $BOOT_TRACE_DIR"
+    fi
 fi
 
 # ---------------------------------------------------------------------------

@@ -136,3 +136,4 @@
 !/profiles/spark1-best.env
 !/files/ours/boot_fast_globs.py
 !/tests/test_boot_fast.py
+!/files/ours/patch_weight_utils_window.py
