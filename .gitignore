@@ -169,3 +169,7 @@
 !/tools/l7/l7_micro.py
 !/tools/l7/lease_l7_micro.sh
 !/tools/l7/make_tiles.py
+!/tools/l7/inlaunch_l7.py
+!/tools/l7/lease_l7_inlaunch.sh
+!/tools/l7/lease_l7_any.sh
+!/tools/l7/sync_l7_spark2.sh
