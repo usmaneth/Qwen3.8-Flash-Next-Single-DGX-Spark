@@ -136,3 +136,12 @@
 !/files/ours/patch_lm_head_fp8.py
 !/profiles/
 !/profiles/spark1-best.env
+
+# kern-decode branch: decode kernel rungs. files/kern/orig/ and out/ are
+# extracted and generated on every launch and stay ignored.
+!/files/kern/
+/files/kern/*
+!/files/kern/gen_kern.py
+!/files/kern/kd_ext.py
+!/files/kern/lm_head_fp8.py
+!/tests/test_kern_ext.py

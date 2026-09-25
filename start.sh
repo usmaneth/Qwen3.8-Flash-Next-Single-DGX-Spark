@@ -119,7 +119,8 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     EXTRA_VLLM_ARGS EXTRA_DOCKER_ARGS NATIVE_MAX_MODEL_LEN
                     YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S API_KEY
                     VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
-                    MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE)
+                    MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE
+                    KERN_DECODE KERN_RPC LM_HEAD_FP8_RESCORE SHORTCONV_ASYNC_H2D)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAP_$_v=\${$_v-}"
     eval "_SNAPSET_$_v=\${$_v+set}"
@@ -317,6 +318,20 @@ VLLM_MOE_DET_FINALIZE="${VLLM_MOE_DET_FINALIZE:-}"
 # for one release (so the knob exists and README documents the stall); flip to
 # triton in a later release only after a soak, so there is a bisectable state.
 GDN_DECODE_KERNEL="${GDN_DECODE_KERNEL:-}"
+# kern-decode rungs (files/kern/gen_kern.py). KERN_DECODE=1 mounts the
+# generated overrides; each change in them is off until its own knob is on,
+# so KERN_DECODE=1 alone runs the image math.
+#   LM_HEAD_FP8_RESCORE=1  R5: FP8 screen + BF16 rescore of the target
+#                          lm_head (+0.64 GB; lower the KV bytes by 768 MiB).
+#   SHORTCONV_ASYNC_H2D=1  R2: no host stream sync in the short-conv
+#                          spec-decode metadata build.
+#   KERN_RPC=1             the kd_ext worker extension and the dev RPC
+#                          endpoint (/collective_rpc) for in-launch A/B arms.
+#                          Only with BIND=127.0.0.1.
+KERN_DECODE="${KERN_DECODE:-0}"
+KERN_RPC="${KERN_RPC:-0}"
+LM_HEAD_FP8_RESCORE="${LM_HEAD_FP8_RESCORE:-0}"
+SHORTCONV_ASYNC_H2D="${SHORTCONV_ASYNC_H2D:-0}"
 # disable_eagle_block_drop (plan 2.4 / review §6.1): speculative-config lever
 # that removes MTP's fixed prefix-cache-block back-off per turn. MTP_NUM_...
 # > 0 and this knob = merge into the speculative-config JSON.
@@ -672,6 +687,29 @@ extract "$MOE_CUTLASS_PKG" "$DET_DIR/orig/flashinfer_cutlass_moe.py"
 python3 "$SCRIPT_DIR/files/patch_determinism.py" || err "patch_determinism.py failed"
 [[ -f "$DET_DIR/flashinfer_cutlass_moe.py" ]] || err "determinism patch missing: flashinfer_cutlass_moe.py"
 
+KERN_MOUNTS=""
+if [[ "$KERN_DECODE" == 1 ]]; then
+    KERN_DIR="$SCRIPT_DIR/files/kern"
+    mkdir -p "$KERN_DIR/orig" "$KERN_DIR/out"
+    KERN_MODEL_PKG="$VLLM_PKG/models/qwen3_8_flash_next/nvidia/model.py"
+    KERN_SC_PKG="$VLLM_PKG/v1/attention/backends/short_conv_attn.py"
+    extract "$KERN_MODEL_PKG" "$KERN_DIR/orig/nvidia_model.py"
+    extract "$KERN_SC_PKG" "$KERN_DIR/orig/short_conv_attn.py"
+    python3 "$KERN_DIR/gen_kern.py" --orig "$KERN_DIR/orig" --out "$KERN_DIR/out" || err "gen_kern.py failed"
+    KERN_MOUNTS="-v $KERN_DIR/out/nvidia_model.py:$KERN_MODEL_PKG:ro"
+    KERN_MOUNTS+=" -v $KERN_DIR/out/lm_head_fp8.py:$VLLM_PKG/models/qwen3_8_flash_next/nvidia/lm_head_fp8.py:ro"
+    KERN_MOUNTS+=" -v $KERN_DIR/out/short_conv_attn.py:$KERN_SC_PKG:ro"
+    KERN_MOUNTS+=" -v $KERN_DIR/out/kd_ext.py:/usr/local/lib/python3.12/dist-packages/kd_ext.py:ro"
+    [[ "$LM_HEAD_FP8_RESCORE" == 1 ]] && KERN_MOUNTS+=" -e VLLM_QWEN38_LM_HEAD_FP8=1"
+    [[ "$SHORTCONV_ASYNC_H2D" == 1 ]] && KERN_MOUNTS+=" -e VLLM_SHORTCONV_ASYNC_H2D=1"
+    if [[ "$KERN_RPC" == 1 ]]; then
+        [[ "$BIND" == "127.0.0.1" ]] || err "KERN_RPC=1 needs BIND=127.0.0.1 (dev endpoints)"
+        KERN_MOUNTS+=" -e VLLM_SERVER_DEV_MODE=1"
+    fi
+elif [[ "$LM_HEAD_FP8_RESCORE" == 1 || "$SHORTCONV_ASYNC_H2D" == 1 || "$KERN_RPC" == 1 ]]; then
+    err "LM_HEAD_FP8_RESCORE, SHORTCONV_ASYNC_H2D and KERN_RPC need KERN_DECODE=1"
+fi
+
 # Reduced-vocabulary drafting. The patch is inert unless VLLM_MTP_DRAFT_VOCAB
 # is set in the container, so it is applied unconditionally.
 PATCHED_MTP="$SCRIPT_DIR/files/mtp_patched.py"
@@ -843,6 +881,7 @@ VLLM_ARGS+=("--max-num-seqs" "$MAX_NUM_SEQS")
 VLLM_ARGS+=("--max-num-batched-tokens" "$MAX_NUM_BATCHED_TOKENS")
 VLLM_ARGS+=("--max-model-len" "$MAX_MODEL_LEN")
 VLLM_ARGS+=("--kv-cache-dtype" "$KV_CACHE_DTYPE")
+[[ "$KERN_DECODE" == 1 && "$KERN_RPC" == 1 ]] && VLLM_ARGS+=("--worker-extension-cls" "kd_ext.KDExt")
 [[ -n "$MAMBA_SSM_CACHE_DTYPE" ]] && VLLM_ARGS+=("--mamba-ssm-cache-dtype" "$MAMBA_SSM_CACHE_DTYPE")
 if [[ -n "$YARN_FACTOR" ]]; then
     # Deep-merged into text_config.rope_parameters, which is what this model
@@ -1092,6 +1131,7 @@ docker run \\
     -v $PATCHED_QSA_NVIDIA:$QSA_NVIDIA_PKG:ro \\
     -v $PATCHED_MTP:$MTP_PKG:ro \\
     -v $DET_DIR/flashinfer_cutlass_moe.py:$MOE_CUTLASS_PKG:ro \\
+    $KERN_MOUNTS \\
     -v $OFFLOAD_DIR/ple_offload_layer.py:$VLLM_PKG/model_executor/layers/ple_offload_layer.py:ro \\
     -v $OFFLOAD_DIR/connector.py:$VLLM_PKG/v1/ple_offload/connector.py:ro \\
     -v $OFFLOAD_DIR/worker.py:$VLLM_PKG/v1/ple_offload/worker.py:ro \\
