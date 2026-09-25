@@ -5,6 +5,31 @@ are grouped by date, newest first. Every measurement named here was taken on the
 one DGX Spark this repo is written for — treat them as that host's numbers, not
 as promises.
 
+## 2026-09-24
+
+### Added
+
+- **PLE row I/O module (`files/ple_io/`, knobs `VLLM_PLE_IO_*`).** The
+  PLE offload worker now gets its rows through `ple_io.gather()`. The bytes
+  still come from one `torch.index_select` over the mmap, so every mode
+  gives the same rows. Two changes are on by default:
+  - B1, `VLLM_PLE_IO_MODE=batch`: a gather of 4096 rows or more (a prefill
+    chunk) sends one batched `process_madvise(MADV_WILLNEED)` over 8
+    threads. A cold 131,072-row set took 43.8 ms, the fadvise loop 94.8 ms.
+  - B2, `VLLM_PLE_IO_DEFER=1`: on eager steps the wait for the PLE rows
+    moves from the connector to the layer that reads them. The GPU runs
+    the embedding and layer 0 during the CPU gather. The GPU gap per cold
+    8K chunk fell from 48.9 to 6.5 ms (r1) and from 53.3 to 10.5 ms (r2).
+  Measured on spark1 (lease l2-20260924T152952, 2 interleaved pairs, cold
+  page cache): TTFT 8K 4.17 to 4.06 s, 32K 16.85 to 16.47 s, 128K 71.96 to
+  70.27 s (about -2.5%). Decode ms/step did not change (85.3/86.5 against
+  85.9/86.1). Gates: CPU byte identity (real table), greedy output
+  identity, GPU/CPU row digests 192/192 joined with 0 mismatches,
+  nllgate.py unchanged. The worker RSS grows by about 4 MB (anonymous).
+  Rollback: `VLLM_PLE_IO_MODE=fadvise` and `VLLM_PLE_IO_DEFER=0` in `.env`.
+  Knobs and the defer safety rules are in README "PLE row I/O". Tests:
+  `files/ple_io/test_ple_io.py`, `test_defer.py`, `test_fast.py`.
+
 ## 2026-09-23
 
 ### Added

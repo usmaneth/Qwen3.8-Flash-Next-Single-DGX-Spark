@@ -816,6 +816,49 @@ bound (1.4 MiB/token at ~26 tok/s, the rate at the time, is only ~36 MB/s). The 
 ~2 GiB of unified memory no longer wasted on readahead that is thrown away,
 which is what funds the KV pool `KV_TARGET_GIB` asks for.
 
+### PLE row I/O
+
+Each forward gathers one packed PLE row per token from the memory-mapped
+table in the offload worker. `files/ple_io/ple_io.py` does this gather. It
+only tells the kernel which pages to read; the bytes always come from one
+`torch.index_select` over the mmap, so every setting below gives the same
+rows. `start.sh` passes each `VLLM_PLE_IO_*` variable (environment or
+`.env`) into the container.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `VLLM_PLE_IO_MODE` | `batch` | `batch`: one batched prefetch for a gather of `BATCH_MIN` rows or more. `fadvise`: one `posix_fadvise(WILLNEED)` per page (the path before ple_io). `none`: no prefetch. |
+| `VLLM_PLE_IO_BACKEND` | `pm` | `pm`: `process_madvise(MADV_WILLNEED)` (needs `CAP_SYS_PTRACE`, which `start.sh` grants). `c`: `ple_io_native.c`, only when `files/ple_io/build/libple_io_native.so` exists. |
+| `VLLM_PLE_IO_THREADS` | `8` | Prefetch threads for a gather above 4096 pages. |
+| `VLLM_PLE_IO_BATCH_MIN` | `4096` | The smallest gather (rows) for `mode=batch`. Decode steps stay on the fadvise loop. |
+| `VLLM_PLE_IO_DEFER` | `1` | `1`: eager steps wait for the rows at the layer that reads them, not before the forward. |
+| `VLLM_PLE_IO_FAST` | `0` | `1`: the numpy row-id path for small batches (B3). Off: the leases measured no decode ms/step gain. |
+| `VLLM_PLE_IO_TRACE_DIR` | empty | A directory for per-gather trace files and a live `ctl` file (benchmarks only). |
+
+Rollback to the path before ple_io: set `VLLM_PLE_IO_MODE=fadvise` and
+`VLLM_PLE_IO_DEFER=0` in `.env`, then run `./stop.sh` and `./start.sh`.
+
+Defer safety. A forward that reads the PLE buffer before the worker writes
+it would read old rows. `ple_io_defer.py` prevents this in three layers:
+
+1. The wrapped replay methods of the vLLM cudagraph manager wait first.
+2. A guard on `torch.cuda.CUDAGraph.replay` waits before every other CUDA
+   graph replay. A new replay path in a later vLLM is therefore safe. The
+   log line `defer-guard` shows that such a path ran.
+3. A backstop after each forward finds a wait that did not occur. It sets
+   the defer off for the life of the process and writes a `defer-backstop`
+   line to stderr. If you see this line, report it: an eager path in the
+   model does not call the PLE placeholder.
+
+If the guard cannot be installed (no Python `replay()` on the graph class),
+the defer stays off. If `process_madvise` fails 3 times, the gather stays
+on the fadvise loop. Both fall back to the old path with the same bytes.
+
+Page cache. The table pages that the worker read stay mapped by its
+`np.memmap`, so `drop_caches` (the memwatch relief) does not drop them.
+Kernel reclaim under memory pressure does. This is why the residency of
+the table is low on a busy host.
+
 ## Unattended operation
 
 The repo ships a supervisor that closes the detect → stop → recover loop the

@@ -17,9 +17,16 @@ Then the hook loader imports each other files/ple_io/patch_*.py in sorted
 order and calls its main(). Each of those files has its own MARK and exits 1
 (which stops start.sh) when an anchor count is not 1.
 
-With no VLLM_PLE_IO_* variable set, ple_io.gather() runs the shipped path
-(fadvise per page, then index_select), and the hooks cost two clock reads
-and one attribute test per step.
+With no VLLM_PLE_IO_* variable set, ple_io.gather() uses the defaults in
+ple_io.DEFAULTS: mode=batch, backend=pm, threads=8, batch_min=4096 (a
+gather of 4096 rows or more gets one batched process_madvise prefetch; a
+smaller gather uses the fadvise loop), and defer=1 (ple_io_defer.py). The
+bytes always come from one index_select over the mmap. The hooks cost two
+clock reads and one attribute test per step.
+
+Rollback to the path before ple_io (fadvise per page, the wait in the
+connector): VLLM_PLE_IO_MODE=fadvise and VLLM_PLE_IO_DEFER=0 in .env.
+README "PLE row I/O" has all the knobs.
 """
 import glob
 import importlib.util
