@@ -26,6 +26,12 @@ import os
 import torch
 
 MIN_BYTES = 1 << 20
+# The routed MoE experts are most of the model bytes (88 GB moved in
+# kern3-h1). The "dense" scope leaves every tensor of these modules in place.
+EXPERT_MODULES = ("FusedMoE", "RoutedExperts")
+# The move stops when MemAvailable falls below this floor (GiB).
+FLOOR_ENV = "KERN_HOSTALLOC_FLOOR_GIB"
+FLOOR_GIB = 12.0
 SO_ENV = "KERN_HOSTALLOC_SO"
 _POOL = {"pool": None, "alloc": None, "so": None}
 _MOVED = {}  # storage data_ptr (new) -> "host"
@@ -57,15 +63,35 @@ def stats() -> dict:
     return {"live": buf[0], "peak": buf[1], "count": buf[2], "mode": buf[3]}
 
 
-def collect(model: torch.nn.Module, min_bytes: int = MIN_BYTES, device_type: str = "cuda"):
+def mem_available_gib() -> float:
+    try:
+        with open("/proc/meminfo") as f:
+            for ln in f:
+                if ln.startswith("MemAvailable:"):
+                    return int(ln.split()[1]) / 1048576
+    except OSError:
+        pass
+    return float("inf")
+
+
+def is_expert_module(mod: torch.nn.Module) -> bool:
+    return any(c.__name__ in EXPERT_MODULES for c in type(mod).__mro__)
+
+
+def collect(model: torch.nn.Module, min_bytes: int = MIN_BYTES, device_type: str = "cuda",
+            scope: str = "all"):
     """Group the model's large tensors by storage.
 
     Returns {storage key: [(owner, attr name, tensor), ...]} and the byte size
     of each storage. Parameters, buffers and tensor attributes of every module
-    count; the same tensor object is listed once.
+    count; the same tensor object is listed once. scope "dense" skips the
+    tensors of the routed-expert modules (EXPERT_MODULES).
     """
+    assert scope in ("all", "dense")
     groups, sizes, seen = {}, {}, set()
     for mod in model.modules():
+        if scope == "dense" and is_expert_module(mod):
+            continue
         items = list(mod._parameters.items()) + list(mod._buffers.items())
         items += [(k, v) for k, v in vars(mod).items()
                   if isinstance(v, torch.Tensor) and not k.startswith("_") and k not in mod._parameters
@@ -97,11 +123,20 @@ def _rebind(entries, new_storage):
 
 
 def move_weights(model: torch.nn.Module, to: str = "host", min_bytes: int = MIN_BYTES,
-                 empty_every: int = 2 << 30, _pool_ctx=None) -> dict:
-    """Move the large tensors of ``model`` to the pool (to="host") or back (to="device")."""
+                 empty_every: int = 2 << 30, _pool_ctx=None, scope: str = "all",
+                 floor_gib: float = None, _mem=mem_available_gib) -> dict:
+    """Move the large tensors of ``model`` to the pool (to="host") or back (to="device").
+
+    A move to the pool stops before the next storage when MemAvailable is
+    below floor_gib; the result then has "aborted" set, and a move back
+    ("device") returns the storages that moved.
+    """
     assert to in ("host", "device")
+    if floor_gib is None:
+        floor_gib = float(os.environ.get(FLOOR_ENV, FLOOR_GIB))
     dev_type = "cuda" if _pool_ctx is None else "cpu"
-    groups, sizes = collect(model, min_bytes, dev_type)
+    # A move back takes every moved storage, whatever the scope of the move.
+    groups, sizes = collect(model, min_bytes, dev_type, scope if to == "host" else "all")
     if to == "host":
         todo = [k for k in groups if k not in _MOVED]
     else:
@@ -111,7 +146,18 @@ def move_weights(model: torch.nn.Module, to: str = "host", min_bytes: int = MIN_
     before = torch.cuda.memory_allocated() if dev_type == "cuda" else 0
     live0 = stats().get("live", 0)
     moved = since = 0
+    aborted = None
+    mem0 = mem_min = _mem()
+    # The stop line: the absolute floor, or 3 GiB below the start (the arm
+    # stop in inlaunch_l7.py is 2 GiB), whichever is higher.
+    line = max(floor_gib, mem0 - 3.0)
     for key in todo:
+        if to == "host":
+            mem = _mem()
+            mem_min = min(mem_min, mem)
+            if mem < line:
+                aborted = f"MemAvailable {mem:.1f} GiB < {line:.1f} GiB (start {mem0:.1f})"
+                break
         entries = groups[key]
         old = entries[0][2].untyped_storage()
         if _pool_ctx is not None:
@@ -145,12 +191,15 @@ def move_weights(model: torch.nn.Module, to: str = "host", min_bytes: int = MIN_
     after = torch.cuda.memory_allocated() if dev_type == "cuda" else 0
     live1 = stats().get("live", 0)
     freed = (before - live0) - (after - live1)  # bytes the default allocator gave back
-    res = {"to": to, "storages": len(todo), "bytes": moved,
+    n_done = len(todo) if aborted is None else todo.index(key)
+    res = {"to": to, "scope": scope, "storages": n_done, "bytes": moved, "aborted": aborted,
+           "mem_min_gib": round(mem_min, 2),
            "default_pool_freed": freed if to == "host" else -freed,
            "freed_share": (freed / moved if moved and to == "host" else None), "alloc": stats()}
     return res
 
 
 def kd_call(model: torch.nn.Module, arg) -> dict:
-    """kd_ext "call" entry: arg "host" or "device"."""
-    return move_weights(model, to=str(arg))
+    """kd_ext "call" entry: arg "host", "host:dense" or "device"."""
+    to, _, scope = str(arg).partition(":")
+    return move_weights(model, to=to, scope=scope or "all")

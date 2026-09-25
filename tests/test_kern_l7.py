@@ -273,6 +273,66 @@ def test_hostalloc_collect_and_cpu_move():
     hostalloc._MOVED.clear()
 
 
+def test_hostalloc_dense_scope_and_floor():
+    """kern3-h1 fix: "dense" skips the routed-expert modules, and a move to the
+    pool stops at the MemAvailable line; a move back returns what moved."""
+    import contextlib
+
+    class FusedMoE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w13_weight = torch.nn.Parameter(torch.ones(1 << 19), requires_grad=False)
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = FusedMoE()
+            self.proj = torch.nn.Parameter(torch.full((1 << 19,), 3.0), requires_grad=False)
+            self.o = torch.nn.Parameter(torch.full((1 << 19,), 4.0), requires_grad=False)
+
+    m = Layer()
+    g_all, _ = hostalloc.collect(m, device_type="cpu")
+    g_dense, _ = hostalloc.collect(m, device_type="cpu", scope="dense")
+    assert len(g_all) == 3 and len(g_dense) == 2
+    exp_ptr = m.experts.w13_weight.untyped_storage().data_ptr()
+    res = hostalloc.move_weights(m, to="host", _pool_ctx=contextlib.nullcontext, scope="dense",
+                                 _mem=lambda: 100.0)
+    assert res["storages"] == 2 and res["aborted"] is None
+    assert m.experts.w13_weight.untyped_storage().data_ptr() == exp_ptr
+    back = hostalloc.move_weights(m, to="device", _pool_ctx=contextlib.nullcontext)
+    assert back["storages"] == 2
+    hostalloc._MOVED.clear()
+    # MemAvailable falls 2 GiB per storage from 20: the line is max(12, 17) = 17,
+    # so the second storage (18 GiB) moves and the third (16 GiB) does not.
+    mem = iter([20.0, 20.0, 18.0, 16.0])
+    res = hostalloc.move_weights(m, to="host", _pool_ctx=contextlib.nullcontext,
+                                 _mem=lambda: next(mem))
+    assert res["aborted"] and res["storages"] == 2, res
+    back = hostalloc.move_weights(m, to="device", _pool_ctx=contextlib.nullcontext)
+    assert back["storages"] == 2
+    assert torch.equal(m.proj, torch.full((1 << 19,), 3.0))
+    assert torch.equal(m.o, torch.full((1 << 19,), 4.0))
+    hostalloc._MOVED.clear()
+
+
+def test_inlaunch_l7_reads_nested_call_result(monkeypatch, tmp_path):
+    """kern3-h1 fix: the freed-share and abort checks read res["done"]."""
+    sys.path.insert(0, os.path.join(os.path.dirname(HERE), "tools", "l7"))
+    inl = pytest.importorskip("inlaunch_l7")
+    key = "call:vllm.models.qwen3_8_flash_next.nvidia.hostalloc:kd_call"
+    for val, want in (({"to": "host", "bytes": 10, "freed_share": 0.9, "aborted": None}, "freed share"),
+                      ({"to": "host", "bytes": 10, "freed_share": 1.0, "aborted": "x"}, "aborted"),
+                      ({"to": "host", "bytes": 10, "freed_share": 0.99, "aborted": None}, None)):
+        monkeypatch.setattr(inl, "_orig_rpc", lambda *a, _v=val, **k: {"done": {key: _v}, "info": {}})
+        monkeypatch.setattr(inl, "mem_avail_gib", lambda: 50.0)
+        knobs = json.dumps({"call": {key[5:]: "host:dense"}})
+        if want is None:
+            inl.rpc(8888, "kd_set", knobs)
+        else:
+            with pytest.raises(RuntimeError, match=want):
+                inl.rpc(8888, "kd_set", knobs)
+
+
 def test_hostalloc_so_exports():
     so = os.path.join(KERN, "hostalloc", "kern_hostalloc.so")
     if not os.path.exists(so):

@@ -42,10 +42,13 @@ def rpc(port, method, *args, timeout=600):
     m1 = mem_avail_gib()
     row = {"calls": calls, "mem_before_gib": round(m0, 2), "mem_after_gib": round(m1, 2), "set": res}
     bad = []
-    done = res if isinstance(res, dict) else {}
+    # kd_set returns {"done": {"call:<target>": <result>, ...}, "info": ...}.
+    done = res.get("done", res) if isinstance(res, dict) else {}
     for key, val in done.items():
         if key.startswith("call:") and "hostalloc" in key and isinstance(val, dict):
             fs = val.get("freed_share")
+            if val.get("aborted"):
+                bad.append(f"move aborted: {val['aborted']}")
             if val.get("to") == "host" and val.get("bytes") and (fs is None or fs < 0.95):
                 bad.append(f"freed share {fs} < 0.95")
     if m0 - m1 > 2.0:
