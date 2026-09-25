@@ -431,10 +431,20 @@ class _PM:
 _pm = _PM()
 _batch_errors = 0
 _batch_off = False
+# _pm.iov, the pm pool and the error counters are shared state. The offload
+# worker calls gather() from one thread, so the lock has no contention. It
+# keeps a future caller with more threads safe (the bytes come from
+# index_select in all cases; only the prefetch advice needs the lock).
+_batch_lock = threading.Lock()
 
 
 def _prefetch_batch(fd, table: torch.Tensor, ids: torch.Tensor) -> int:
     """One batched prefetch. Return the pages advised, or -1 after an error."""
+    with _batch_lock:
+        return _prefetch_batch_locked(fd, table, ids)
+
+
+def _prefetch_batch_locked(fd, table: torch.Tensor, ids: torch.Tensor) -> int:
     global _batch_errors, _batch_off
     try:
         if BACKEND == "pm":

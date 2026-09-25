@@ -132,6 +132,76 @@ def main() -> int:
                 fails += 1
                 print("FAIL the batch path is off")
 
+    # Concurrent callers: 4 threads gather at the same time with the pm
+    # backend (shared iovec buffer and pool). The bytes and the backend
+    # must stay correct, with no fallback.
+    import threading
+    ple_io.MODE, ple_io.BACKEND, ple_io.THREADS, ple_io.BATCH_MIN = "batch", "pm", 4, 0
+    ple_io.TRACE, ple_io.TRACE_RES = False, 0
+    err0 = ple_io._batch_errors
+    bad: list[str] = []
+    seeds = [args.seed + 100 + k for k in range(4)]
+
+    def worker(seed: int) -> None:
+        g = torch.Generator().manual_seed(seed)
+        for it in range(4 if args.quick else 12):
+            n = (4096, 20000, 131072)[it % 3]
+            ids = torch.randint(0, rows, (n,), generator=g, dtype=torch.int64)
+            out = torch.empty((n, width), dtype=torch.uint8)
+            ple_io.gather(fd, table, ids, out)
+            if not torch.equal(out, torch.index_select(ref_table, 0, ids)):
+                bad.append(f"seed {seed} it {it} n {n}")
+
+    def run_threads() -> None:
+        ths = [threading.Thread(target=worker, args=(sd,)) for sd in seeds]
+        for t in ths:
+            t.start()
+        for t in ths:
+            t.join()
+
+    run_threads()
+    checks += 1
+    if bad or ple_io._batch_errors != err0 or ple_io._batch_off:
+        fails += 1
+        print(f"FAIL concurrent gathers: {bad[:3]} errors "
+              f"{ple_io._batch_errors - err0} off {ple_io._batch_off}")
+
+    # The advice itself: with threads=1 each _run() call runs in the caller
+    # thread. The stand-in sleeps before it reads the shared iovec buffer,
+    # then compares the pages to the pages of its own ids. Without the lock
+    # another thread writes the buffer during the sleep.
+    import time as _time
+    ple_io.THREADS = 1
+    real_run = ple_io._PM._run
+    want_pages = threading.local()
+    advice_bad: list[str] = []
+
+    def run_check(self, iov, lo, hi):
+        _time.sleep(0.002)
+        got = iov[lo:hi, 0] - np.uint64(table.data_ptr())
+        if not np.array_equal(got >> np.uint64(12), want_pages.v[lo:hi]):
+            advice_bad.append(f"{threading.current_thread().name} [{lo},{hi})")
+        return real_run(self, iov, lo, hi)
+
+    real_gather = ple_io.gather
+
+    def gather_check(fd_, t_, ids_, out_):
+        want_pages.v = ple_io._np_pages(ids_.numpy().astype(np.int64), width).astype(np.uint64)
+        real_gather(fd_, t_, ids_, out_)
+
+    ple_io._PM._run = run_check
+    ple_io.gather = gather_check
+    try:
+        run_threads()
+    finally:
+        ple_io._PM._run = real_run
+        ple_io.gather = real_gather
+    checks += 1
+    if advice_bad or bad:
+        fails += 1
+        print(f"FAIL concurrent advice: {len(advice_bad)} runs saw another "
+              f"thread's pages {advice_bad[:3]}")
+
     # batch_min: a gather below it does not call the backend, one at or
     # above it does.
     calls = []
