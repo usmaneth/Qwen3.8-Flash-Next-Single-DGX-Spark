@@ -772,6 +772,13 @@ if [[ "$BOOT_FAST_WINDOW$BOOT_FAST_MTP_FILES$BOOT_FAST_PLE_FILES$BOOT_FAST_EXPER
         _bf_mount "$OURS/routed_experts.py" model_executor/layers/fused_moe/routed_experts.py
         info "  R4 expert lookup: on"
     fi
+    if [[ "$BOOT_FAST_SKIP_MM_WARMUP" == "1" ]]; then
+        extract "$VLLM_PKG/renderers/base.py" "$OURS/base.py.orig"
+        python3 "$OURS/patch_mm_warmup.py" >/dev/null || err "patch_mm_warmup.py failed"
+        _bf_mount "$OURS/base.py" renderers/base.py
+        BF_DOCKER_ARGS+=" -e VLLM_SKIP_MM_WARMUP=1"
+        info "  R9 multi-modal warmup: skipped"
+    fi
     if [[ "$BOOT_HASH" == "1" ]]; then
         extract "$VLLM_PKG/v1/worker/gpu/model_runner.py" "$OURS/model_runner.py.orig"
         python3 "$OURS/patch_model_runner_hash.py" >/dev/null || err "patch_model_runner_hash.py failed"
