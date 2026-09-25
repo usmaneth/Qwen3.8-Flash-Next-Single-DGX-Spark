@@ -120,7 +120,8 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S API_KEY
                     VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
                     MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE
-                    KERN_DECODE KERN_RPC LM_HEAD_FP8_RESCORE SHORTCONV_ASYNC_H2D MTP_DENSE_W8A16 PLE_GPU_WAIT MTP_DENSE_W4A16 MTP_DRAFT_HEAD_W4 KERN_SKINNY MTP_FUSED_NORM QSA_FUSED_DRAFT)
+                    KERN_DECODE KERN_RPC LM_HEAD_FP8_RESCORE SHORTCONV_ASYNC_H2D MTP_DENSE_W8A16 PLE_GPU_WAIT MTP_DENSE_W4A16 MTP_DRAFT_HEAD_W4 KERN_SKINNY MTP_FUSED_NORM QSA_FUSED_DRAFT
+                    KERN_L7 KERN_SKINNY_MX KERN_SKINNY_MX_FUSED KERN_SGATE KERN_L7_TILES KERN_L7_TILES_ON KERN_HOSTALLOC_MODE)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAP_$_v=\${$_v-}"
     eval "_SNAPSET_$_v=\${$_v+set}"
@@ -349,6 +350,24 @@ MTP_DRAFT_HEAD_W4="${MTP_DRAFT_HEAD_W4:-0}"
 # R6: KERN_SKINNY=1 routes the router, GDN ba and HC linears of the target
 # through a skinny BF16 GEMM for M <= 16 (files/kern/skinny_bf16.py).
 KERN_SKINNY="${KERN_SKINNY:-0}"
+# L7 (branch kern-l7, needs KERN_DECODE=1): KERN_L7=1 mounts l7.py,
+# skinny_mx.py, sgate.py, hostalloc.py and kern_hostalloc.so, and makes
+# model.py call enable_l7(). Each part stays off until its own knob:
+#   KERN_SKINNY_MX=1        S1: skinny GEMV for the MXFP8 linears, M <= 16.
+#   KERN_SKINNY_MX_FUSED=1  S1q: the MXFP8 activation quantizer in the GEMV.
+#   KERN_SGATE=1            S3: the shared-expert gate as one kernel.
+#   KERN_L7_TILES=<file>    R6t and S2: tile tables of the L7 micro sweep
+#                           (kd_ext call l7:kd_call; KERN_L7_TILES_ON=1 = on).
+#   KERN_HOSTALLOC_MODE     H1: memory kind of the weight pool (host, vmm_dev,
+#                           vmm_host, device); the move is the kd_ext call
+#                           hostalloc:kd_call ("host" or "device").
+KERN_L7="${KERN_L7:-0}"
+KERN_SKINNY_MX="${KERN_SKINNY_MX:-0}"
+KERN_SKINNY_MX_FUSED="${KERN_SKINNY_MX_FUSED:-0}"
+KERN_SGATE="${KERN_SGATE:-0}"
+KERN_L7_TILES="${KERN_L7_TILES:-}"
+KERN_L7_TILES_ON="${KERN_L7_TILES_ON:-0}"
+KERN_HOSTALLOC_MODE="${KERN_HOSTALLOC_MODE:-host}"
 # R21: QSA_FUSED_DRAFT=1 lets the drafter capture the 1-token draft passes
 # 1..K-1 as one CUDA graph (the QSA metadata builder refreshes its metadata
 # inside the graph). kd_ext knob fused_draft switches it at run time.
@@ -733,6 +752,25 @@ if [[ "$KERN_DECODE" == 1 ]]; then
     [[ "$MTP_DRAFT_HEAD_W4" == 1 ]] && KERN_MOUNTS+=" -e VLLM_MTP_DRAFT_HEAD_W4=1"
     KERN_MOUNTS+=" -v $KERN_DIR/out/skinny_bf16.py:$VLLM_PKG/models/qwen3_8_flash_next/nvidia/skinny_bf16.py:ro"
     [[ "$KERN_SKINNY" == 1 ]] && KERN_MOUNTS+=" -e VLLM_KERN_SKINNY=1"
+    if [[ "$KERN_L7" == 1 ]]; then
+        KERN_NV="$VLLM_PKG/models/qwen3_8_flash_next/nvidia"
+        for _f in l7.py skinny_mx.py sgate.py hostalloc.py; do
+            KERN_MOUNTS+=" -v $KERN_DIR/out/$_f:$KERN_NV/$_f:ro"
+        done
+        if [[ ! -f "$KERN_DIR/hostalloc/kern_hostalloc.so" ]]; then
+            bash "$KERN_DIR/hostalloc/build.sh" >/dev/null || err "kern_hostalloc.so build failed"
+        fi
+        KERN_MOUNTS+=" -v $KERN_DIR/hostalloc/kern_hostalloc.so:$KERN_NV/kern_hostalloc.so:ro"
+        KERN_MOUNTS+=" -e VLLM_KERN_L7=1 -e KERN_HOSTALLOC_MODE=$KERN_HOSTALLOC_MODE"
+        [[ "$KERN_SKINNY_MX" == 1 ]] && KERN_MOUNTS+=" -e VLLM_KERN_SKINNY_MX=1"
+        [[ "$KERN_SKINNY_MX_FUSED" == 1 ]] && KERN_MOUNTS+=" -e VLLM_KERN_SKINNY_MX_FUSED=1"
+        [[ "$KERN_SGATE" == 1 ]] && KERN_MOUNTS+=" -e VLLM_KERN_SGATE=1"
+        if [[ -n "$KERN_L7_TILES" ]]; then
+            [[ -f "$KERN_L7_TILES" ]] || err "KERN_L7_TILES=$KERN_L7_TILES not found"
+            KERN_MOUNTS+=" -v $KERN_L7_TILES:/kern-l7-tiles.json:ro -e VLLM_KERN_L7_TILES=/kern-l7-tiles.json"
+            [[ "$KERN_L7_TILES_ON" == 1 ]] && KERN_MOUNTS+=" -e VLLM_KERN_L7_TILES_ON=1"
+        fi
+    fi
     KERN_MOUNTS+=" -v $KERN_DIR/out/ple_gpu_wait.py:$VLLM_PKG/model_executor/layers/ple_gpu_wait.py:ro"
     [[ "$PLE_GPU_WAIT" == 1 ]] && KERN_MOUNTS+=" -e VLLM_PLE_GPU_WAIT=1"
     [[ "$LM_HEAD_FP8_RESCORE" == 1 ]] && KERN_MOUNTS+=" -e VLLM_QWEN38_LM_HEAD_FP8=1"

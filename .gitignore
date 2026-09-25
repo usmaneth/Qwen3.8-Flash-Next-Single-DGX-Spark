@@ -151,3 +151,21 @@
 !/files/kern/w4a16.py
 !/files/kern/skinny_bf16.py
 !/tests/test_kern_ext.py
+# kern-l7 branch (L7 skinny rungs): kernels, the host allocator source, the
+# CPU tests and the micro-lease tools. kern_hostalloc.so is a build output.
+!/files/kern/l7.py
+!/files/kern/skinny_mx.py
+!/files/kern/sgate.py
+!/files/kern/hostalloc.py
+!/files/kern/hostalloc/
+/files/kern/hostalloc/*
+!/files/kern/hostalloc/kern_hostalloc.cpp
+!/files/kern/hostalloc/build.sh
+!/tests/test_kern_l7.py
+!/tools/
+/tools/*
+!/tools/l7/
+/tools/l7/*
+!/tools/l7/l7_micro.py
+!/tools/l7/lease_l7_micro.sh
+!/tools/l7/make_tiles.py

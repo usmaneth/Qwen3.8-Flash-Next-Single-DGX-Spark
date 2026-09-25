@@ -37,6 +37,10 @@ with the matching env var would run it:
                the path in: set recapture with it.
   attr         {"module:attr": value}: set a module attribute of a kern
                patch (the flags of later rungs).
+  call         {"module:function": arg}: L7. Call function(models, arg)
+               with an nn.ModuleList of the target and the drafter model
+               (l7:kd_call switches the tile table, hostalloc:kd_call
+               moves the weights). Runs before recapture.
   recapture    true: capture all CUDA graphs again (target and drafter).
                For knobs that a graph bakes in at capture time.
 
@@ -376,6 +380,18 @@ class KDExt:
                 raise RuntimeError(f"attr: {mname} has no attribute {aname}")
             setattr(mod, aname, val)
             done[key] = val
+        for key, arg in (knobs.get("call") or {}).items():
+            # L7: {"module:function": arg}; function(models, arg) gets an
+            # nn.ModuleList of the target model and the drafter model.
+            mname, fname = key.split(":")
+            mod = importlib.import_module(mname)
+            if not hasattr(mod, fname):
+                raise RuntimeError(f"call: {mname} has no function {fname}")
+            models = [r.model]
+            dm = getattr(getattr(r, "speculator", None), "model", None)
+            if isinstance(dm, torch.nn.Module) and dm is not r.model:
+                models.append(dm)
+            done["call:" + key] = getattr(mod, fname)(torch.nn.ModuleList(models), arg)
         if knobs.get("recapture"):
             done["recapture_s"] = self._kd_recapture()
         done["absent_off"] = absent

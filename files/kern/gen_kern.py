@@ -31,6 +31,10 @@ kd_ext knob turns it on, so the knob-off behavior is the image behavior.
                         passes 1..K-1 as one CUDA graph (the add-only diff of
                         the recipe file files/ours/qsa_cache.py).
 
+  out/l7.py, skinny_mx.py, sgate.py, hostalloc.py
+                        L7 (kern-l7 branch): byte copies. model.py calls
+                        enable_l7(self) when VLLM_KERN_L7=1.
+
     python3 gen_kern.py --orig files/kern/orig --out files/kern/out
 """
 import argparse
@@ -69,7 +73,13 @@ R5_PAIRS = [
         "            # (skinny_bf16.py). It is off by default.\n"
         "            from .skinny_bf16 import enable_skinny\n"
         "\n"
-        "            enable_skinny(self)\n",
+        "            enable_skinny(self)\n"
+        '        if os.environ.get("VLLM_KERN_L7", "0") == "1":\n'
+        "            # L7: skinny MXFP8 GEMV, shared-expert gate kernel and the\n"
+        "            # micro-sweep tile tables (l7.py). It is off by default.\n"
+        "            from .l7 import enable_l7\n"
+        "\n"
+        "            enable_l7(self)\n",
     ),
 ]
 
@@ -235,7 +245,8 @@ JOBS = [
     ("short_conv_attn.py", "short_conv_attn.py", patch_short_conv),
     ("qsa_cache.py", "qsa_cache.py", patch_qsa_cache),
 ]
-COPIES = ["lm_head_fp8.py", "kd_ext.py", "mtp_w8a16.py", "ple_gpu_wait.py", "w4a16.py", "skinny_bf16.py"]
+COPIES = ["lm_head_fp8.py", "kd_ext.py", "mtp_w8a16.py", "ple_gpu_wait.py", "w4a16.py", "skinny_bf16.py",
+          "l7.py", "skinny_mx.py", "sgate.py", "hostalloc.py"]
 
 
 def main() -> int:
