@@ -311,6 +311,8 @@ class KDExt:
                 raise RuntimeError("skinny: needs VLLM_KERN_SKINNY=1 at launch")
             mod._ON = bool(knobs["skinny"])
             done["skinny"] = mod._ON
+        if "fi_tactic" in knobs:
+            done["fi_tactic"] = self._kd_fi_tactic(knobs["fi_tactic"])
         for key, val in (knobs.get("attr") or {}).items():
             mname, aname = key.split(":")
             mod = importlib.import_module(mname)
@@ -321,6 +323,40 @@ class KDExt:
         if knobs.get("recapture"):
             done["recapture_s"] = self._kd_recapture()
         return {"done": done, "info": self.kd_info()}
+
+    def _kd_fi_tactic(self, rules):
+        """R7: set FlashInfer autotuner tactics of the loaded config file.
+
+        rules: [{"op": "mxfp8_gemm", "match": "(6144, 2560)", "max_m": 64,
+        "tactic": 3}]; tactic null restores the file value. The graphs keep
+        the old kernel until a recapture.
+        """
+        from flashinfer.autotuner import AutoTuner
+
+        tuner = AutoTuner.get()
+        st = self._kd_state()
+        orig = st.setdefault("fi_orig", {})
+        changed = 0
+        for rule in rules or []:
+            for key in list(tuner._file_configs):
+                if rule["op"] not in key or rule["match"] not in key:
+                    continue
+                try:
+                    m = int(key.split("((", 1)[1].split(",", 1)[0])
+                except (IndexError, ValueError):
+                    continue
+                if m > rule.get("max_m", 64):
+                    continue
+                orig.setdefault(key, tuner._file_configs[key])
+                runner, _ = tuner._file_configs[key]
+                t = rule.get("tactic")
+                tuner._file_configs[key] = orig[key] if t is None else (runner, t)
+                changed += 1
+        # live-tuning entries win over the file; drop the matching ones
+        for ck in list(tuner.profiling_cache):
+            if any(r["op"] in str(ck) and r["match"] in str(ck) for r in rules or []):
+                tuner.profiling_cache.pop(ck, None)
+        return changed
 
     def _kd_recapture(self):
         r = self._kd_runner()
