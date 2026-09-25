@@ -900,6 +900,19 @@ except Exception as e:
     print(json.dumps({"declared": declared, "error": str(e)[:200]}, default=str))
     sys.exit(3)
 '
+        # _last_json_line: print the last stdin line that is a JSON object, or fail.
+        _last_json_line() {
+            python3 -c 'import json,sys
+last = None
+for line in sys.stdin:
+    line = line.strip()
+    if line.startswith("{"):
+        try:
+            json.loads(line); last = line
+        except ValueError:
+            pass
+sys.exit(1) if last is None else print(last)'
+        }
         _QCACHE=""
         if [[ "${BOOT_FAST_PREFLIGHT_CACHE:-${BOOT_FAST:-0}}" == "1" ]]; then
             _QKEY=$( { docker image inspect "$IMAGE" --format '{{.Id}} {{json .RepoDigests}}'
@@ -909,11 +922,12 @@ except Exception as e:
             _QCACHE="$HOME/.cache/vllm/boot-fast/preflight-$_QKEY.json"
         fi
         if [[ -n "$_QCACHE" && -s "$_QCACHE" ]]; then
-            _DISPATCH=$(cat "$_QCACHE")
+            _DISPATCH=$(_last_json_line < "$_QCACHE" || echo "")
             info "quant_algo pre-flight: cached result $(basename "$_QCACHE") (R11)"
         else
+            # vLLM prints log lines to stdout on import, so keep only the last JSON line.
             _DISPATCH=$(docker run --rm --entrypoint python3 \
-                -v "$MODEL_PATH/$SNAPSHOT_REL:/m:ro" "$IMAGE" -c "$_QPROBE" 2>/dev/null || echo "")
+                -v "$MODEL_PATH/$SNAPSHOT_REL:/m:ro" "$IMAGE" -c "$_QPROBE" 2>/dev/null | _last_json_line || echo "")
             # Only a clean result is cached: an error or an empty result runs the probe again next time.
             if [[ -n "$_QCACHE" && -n "$_DISPATCH" && "$_DISPATCH" != *'"error"'* ]]; then
                 mkdir -p "$(dirname "$_QCACHE")"
