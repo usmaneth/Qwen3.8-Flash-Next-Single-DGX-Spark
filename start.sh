@@ -746,6 +746,18 @@ if [[ "$BOOT_FAST_WINDOW$BOOT_FAST_MTP_FILES$BOOT_FAST_PLE_FILES$BOOT_FAST_EXPER
         BF_DOCKER_ARGS+=" -e VLLM_ST_DROP_DONE=1 -e VLLM_ST_SKIP_PLE_ONLY=1"
         info "  R3+R5 window: $BOOT_FAST_WINDOW_FILES file(s) ahead, $BOOT_FAST_WINDOW_METHOD x$BOOT_FAST_WINDOW_THREADS, PLE-only files skipped"
     fi
+    if [[ "$BOOT_FAST_MTP_FILES" == "1" || "$BOOT_HASH" == "1" ]]; then
+        python3 "$OURS/patch_mtp_file_filter.py" >/dev/null || err "patch_mtp_file_filter.py failed"
+    fi
+    if [[ "$BOOT_FAST_MTP_FILES" == "1" && "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
+        [[ -n "$BF_MTP_GLOB" ]] || err "BOOT_FAST_MTP_FILES=1 but the index gives no MTP glob."
+        BF_DOCKER_ARGS+=" -e 'VLLM_MTP_FILE_GLOB=$BF_MTP_GLOB'"
+        if [[ -n "$BOOT_FAST_MTP_ALLOW" ]]; then
+            [[ -r "$BOOT_FAST_MTP_ALLOW" ]] || err "BOOT_FAST_MTP_ALLOW=$BOOT_FAST_MTP_ALLOW is not readable"
+            BF_DOCKER_ARGS+=" -v $BOOT_FAST_MTP_ALLOW:/root/mtp_unloaded_allow.json:ro -e VLLM_MTP_UNLOADED_ALLOW=/root/mtp_unloaded_allow.json"
+        fi
+        info "  R2 drafter files: $BF_MTP_GLOB"
+    fi
     if [[ "$BOOT_TRACE" == "1" ]]; then
         mkdir -p "$BOOT_TRACE_DIR"
         BF_DOCKER_ARGS+=" -v $BOOT_TRACE_DIR:/root/boot-trace -e VLLM_ST_TRACE_DIR=/root/boot-trace"
