@@ -26,12 +26,14 @@ if [[ "$NODE" != "$(hostname -s)" ]]; then
 fi
 ( cd "$WT" && git rev-parse HEAD ) > "$RUN/head.txt"
 log "G6 lease $N on $NODE, head $(cat "$RUN/head.txt")"
-# Stop rules before the GPU work: no vLLM server may run, and spark1 keeps
-# MemAvailable >= 20 GiB for the desktop.
+# Stop rules before the GPU work: no vLLM server may run. The memory rule for
+# a GPU job is the memwatch floor (brief correction 2026-09-25 05:30): this
+# job has no server and maps at most a few MB of the table, so it only needs
+# MemAvailable above the floor with a margin (10 GiB) on either node.
 if on "docker ps --format '{{.Names}}'" | grep -q vllm; then log "a vllm container is up: stop"; exit 3; fi
 avail=$(on "awk '/^MemAvailable:/ {print int(\$2/1048576)}' /proc/meminfo")
 log "MemAvailable ${avail} GiB"
-if [[ "$NODE" == spark1 && "$avail" -lt 20 ]]; then log "spark1 MemAvailable < 20 GiB: stop"; exit 4; fi
+if [[ "$avail" -lt 10 ]]; then log "MemAvailable < 10 GiB: stop"; exit 4; fi
 log "probe before: $(on 'bash /models/usman/qwen38-tune/probe.sh 2>&1 | tail -1')"
 on "timeout 2700 docker run --rm --gpus all --name fx-ple-g6 --entrypoint python3 \
   -e TRITON_CACHE_DIR=/triton-cache -v /models/usman/triton-cache:/triton-cache \

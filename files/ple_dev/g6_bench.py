@@ -21,13 +21,27 @@ Steps, in order. A step that fails stops the run (the stop rules of PLAN.md):
   G6 timing of the captured graph for one decode step (R = 1, T = 7, 112
      rows), real row sets from the golden decode steps. Conditions, in
      interleaved blocks (A B A B), 200 replays per block:
-       warm       all pages of the step resident (A arm, twice: noise band)
+       warm       all pages of the step resident and mapped (A arm, twice:
+                  noise band)
        cold       the cold pages of the step evicted, no prefetch
+       minor      the page table entries of the cold pages removed, the
+                  pages stay in the page cache: no I/O, one ATS fault per
+                  page. (p50(minor) - p50(warm)) / cold pages is the cost of
+                  one GPU fault on a cached page.
        staged     the cold pages evicted, a CPU thread issues
                   posix_fadvise(WILLNEED) for the pages of token j at its
                   lead time before the replay: token j (0 = bonus) gets
-                  (6 - j) x 1.34 + 1.1 ms (the d6 pages get 1.1 ms)
-       staged-0.3 the same with every lead cut to 0.3 ms (margin check)
+                  (6 - j) x LEAD_PASS_MS + LEAD_TAIL_MS (the d6 pages get
+                  the tail only). The pages are cached but not mapped.
+       staged_pop the same, then MADV_POPULATE_READ on the same pages in the
+                  same thread, so the page table entries exist before the
+                  replay (the design candidate; CPU data in
+                  coldfault-20260925: 0.02 us per page at the consumer).
+       staged_pop_0.3  staged_pop with every lead cut to 0.3 ms (margin)
+     The prefetch thread records how late each batch starts against its
+     target (lateness). The main thread sleeps (it does not spin) until the
+     replay, and the switch interval is 50 us, so the GIL does not delay the
+     prefetch thread.
      The cold page count per step comes from coldmiss.json (S1 own mix),
      so the evicted fraction is the measured one, not "all".
      Eviction: madvise(MADV_DONTNEED) on the pages in this process's
@@ -62,7 +76,9 @@ EOS = 248044
 # spark2). Tail: the embedding plus layer 0 before the PLE layer, about
 # 1.1 ms (kern-decode PLAN.md R3a). Draft i is known (6 - i) passes plus the
 # tail before the gather; the bonus token 6 passes plus the tail.
-LEAD_PASS_MS = 1.34
+# Update 2026-09-25: the shipping stack F0 (LADDER.md kern-r21) has a draft
+# part of 6.45 ms, so one pass is 1.08 ms. The d6 lead does not change.
+LEAD_PASS_MS = 1.08
 LEAD_TAIL_MS = 1.1
 
 
@@ -111,9 +127,17 @@ class Table:
             self.libc.madvise(ctypes.c_void_p(self.addr + p * PAGE), ctypes.c_size_t(PAGE), 4)
             os.posix_fadvise(self.fd, p * PAGE, PAGE, os.POSIX_FADV_DONTNEED)
 
-    def prefetch(self, pages: np.ndarray) -> None:
+    def prefetch(self, pages: np.ndarray, populate: bool = False) -> None:
         for p in pages.tolist():
             os.posix_fadvise(self.fd, p * PAGE, PAGE, os.POSIX_FADV_WILLNEED)
+        if populate:  # MADV_POPULATE_READ (22): wait for the I/O, fill the PTEs
+            for p in pages.tolist():
+                self.libc.madvise(ctypes.c_void_p(self.addr + p * PAGE), ctypes.c_size_t(PAGE), 22)
+
+    def zap(self, pages: np.ndarray) -> None:
+        # MADV_DONTNEED on the mapping only: the PTE goes, the page stays cached.
+        for p in pages.tolist():
+            self.libc.madvise(ctypes.c_void_p(self.addr + p * PAGE), ctypes.c_size_t(PAGE), 4)
 
     def resident(self, pages: np.ndarray) -> int:
         vec = (ctypes.c_ubyte * 1)()
@@ -166,6 +190,87 @@ def cuda_view(addr: int, nbytes: int):
     return torch.utils.dlpack.from_dlpack(new(ctypes.addressof(mt), b"dltensor", None))
 
 
+def g6_loop(a, tab, dec, cold_frac, set_inputs, replay_us, res) -> None:
+    """The G6 conditions. set_inputs(g) loads one step; replay_us(g) runs it
+    and returns its time in microseconds."""
+    rng = np.random.default_rng(1)
+    leads = [(6 - j) * LEAD_PASS_MS + LEAD_TAIL_MS for j in range(7)]
+    order = ["warm_a", "cold", "minor", "staged", "staged_pop", "warm_b", "staged_pop_0.3"]
+    stats = {c: [] for c in order}
+    late = {c: [] for c in order}
+    ncold = {c: [] for c in order}
+    evict_check = []
+    minor_check = []
+    sys.setswitchinterval(5e-5)
+    for blk in range(a.blocks):
+        for cond in (order if blk % 2 == 0 else order[::-1]):
+            for _ in range(a.replays):
+                g = dec[int(rng.integers(0, len(dec)))]
+                pg = [pages_of(g["rowids"][j]) for j in range(7)]
+                allp = np.unique(np.concatenate(pg))
+                set_inputs(g)
+                if cond.startswith("warm"):
+                    tab.touch(allp)
+                    th = None
+                elif cond == "minor":
+                    tab.touch(allp)
+                    cold = rng.choice(allp, size=int(round(cold_frac * allp.size)), replace=False)
+                    tab.zap(cold)
+                    ncold[cond].append(int(cold.size))
+                    if len(minor_check) < 50:
+                        minor_check.append(tab.resident(cold) / max(cold.size, 1))
+                    th = None
+                else:
+                    tab.touch(allp)
+                    cold = rng.choice(allp, size=int(round(cold_frac * allp.size)), replace=False)
+                    tab.evict(cold)
+                    ncold[cond].append(int(cold.size))
+                    if len(evict_check) < 50:
+                        evict_check.append(tab.resident(cold) / max(cold.size, 1))
+                    th = None
+                    if cond != "cold":
+                        cut = 0.3 if cond.endswith("_0.3") else None
+                        pop = cond.startswith("staged_pop")
+                        sched = [((cut if cut else leads[j]), np.intersect1d(pg[j], cold))
+                                 for j in range(7)]
+                        sched.sort(key=lambda x: -x[0])
+                        t_rep = time.perf_counter() + sched[0][0] / 1e3
+
+                        # Batches with the same lead form one group: the thread
+                        # issues WILLNEED for the whole group first, then
+                        # populates it (the design of the C++ thread).
+                        groups = {}
+                        for lead, pp in sched:
+                            groups.setdefault(lead, []).append(pp)
+                        gsched = [(ld, np.concatenate(v)) for ld, v in groups.items()]
+
+                        def run(sched=gsched, t_rep=t_rep, pop=pop, lt=late[cond]):
+                            for lead, pp in sched:
+                                target = t_rep - lead / 1e3
+                                while time.perf_counter() < target:
+                                    pass
+                                lt.append((time.perf_counter() - target) * 1e6)
+                                tab.prefetch(pp, populate=pop)
+                        th = threading.Thread(target=run)
+                        th.start()
+                        while time.perf_counter() < t_rep - 2e-4:
+                            time.sleep(1e-4)
+                        while time.perf_counter() < t_rep:
+                            pass
+                stats[cond].append(replay_us(g))
+                if th is not None:
+                    th.join()
+    res["G6"] = {c: pct(v) for c, v in stats.items()}
+    res["G6_lateness_us"] = {c: pct(v) for c, v in late.items() if v}
+    res["G6_cold_pages_mean"] = {c: float(np.mean(v)) for c, v in ncold.items() if v}
+    if stats["minor"] and ncold["minor"]:
+        res["ats_minor_fault_us_per_page"] = (
+            (np.percentile(stats["minor"], 50) - np.percentile(stats["warm_a"] + stats["warm_b"], 50))
+            / float(np.mean(ncold["minor"])))
+    res["minor_resident_frac_mean"] = float(np.mean(minor_check)) if minor_check else None
+    res["evict_resident_frac_mean"] = float(np.mean(evict_check)) if evict_check else None
+    res["leads_ms"] = leads
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--golden", required=True)
@@ -176,6 +281,9 @@ def main() -> int:
     ap.add_argument("--blocks", type=int, default=4)
     ap.add_argument("--replays", type=int, default=200)
     ap.add_argument("--cpu-dry", action="store_true")
+    ap.add_argument("--cpu-loop", action="store_true",
+                    help="with --cpu-dry: run the G6 loop with a CPU gather. Use only with a "
+                         "private --table (it evicts pages), never with the served table")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     res = {"node": os.uname().nodename, "date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -253,6 +361,15 @@ def main() -> int:
         allp = np.unique(np.concatenate(pg))
         cold = rng.choice(allp, size=int(round(cold_frac * allp.size)), replace=False)
         res["dry"] = {"leads_ms": leads, "pages": int(allp.size), "cold_pages": int(cold.size)}
+        if a.cpu_loop:
+            if os.path.realpath(a.table) == os.path.realpath(TABLE):
+                return done(14)
+
+            def replay_us(g):
+                t0 = time.perf_counter()
+                tw.gather_twin(flat, g["rowids"][:7], ROW)
+                return (time.perf_counter() - t0) * 1e6
+            g6_loop(a, tab, dec, cold_frac, lambda g: None, replay_us, res)
         return done(0)
     ids_b = torch.zeros(28, dtype=torch.int32, device=dev)
     qsl_b = torch.zeros(5, dtype=torch.int32, device=dev)
@@ -294,58 +411,22 @@ def main() -> int:
     if k3_bad or not k3_n:
         return done(13)
     # G6
-    rng = np.random.default_rng(1)
-    leads = [(6 - j) * LEAD_PASS_MS + LEAD_TAIL_MS for j in range(7)]
     ev0, ev1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    stats = {c: [] for c in ("warm_a", "cold", "warm_b", "staged", "staged_0.3")}
-    order = ["warm_a", "cold", "staged", "warm_b", "staged_0.3"]
-    evict_check = []
-    for blk in range(a.blocks):
-        for cond in (order if blk % 2 == 0 else order[::-1]):
-            for _ in range(a.replays):
-                g = dec[int(rng.integers(0, len(dec)))]
-                pg = [pages_of(g["rowids"][j]) for j in range(7)]
-                allp = np.unique(np.concatenate(pg))
-                ids_b[:7].copy_(torch.from_numpy(g["ids"]))
-                qsl_b[:2].copy_(torch.from_numpy(g["qsl"]))
-                nctx_b[:1].copy_(torch.from_numpy(g["nctx"]))
-                torch.cuda.synchronize()
-                if cond.startswith("warm"):
-                    tab.touch(allp)
-                    th = None
-                else:
-                    tab.touch(allp)
-                    cold = rng.choice(allp, size=int(round(cold_frac * allp.size)), replace=False)
-                    tab.evict(cold)
-                    if len(evict_check) < 50:
-                        evict_check.append(tab.resident(cold) / max(cold.size, 1))
-                    th = None
-                    if cond != "cold":
-                        cut = 0.3 if cond == "staged_0.3" else None
-                        sched = [((cut if cut else leads[j]), np.intersect1d(pg[j], cold))
-                                 for j in range(7)]
-                        sched.sort(key=lambda x: -x[0])
-                        t_rep = time.perf_counter() + sched[0][0] / 1e3
 
-                        def run(sched=sched, t_rep=t_rep):
-                            for lead, pp in sched:
-                                while time.perf_counter() < t_rep - lead / 1e3:
-                                    pass
-                                tab.prefetch(pp)
-                        th = threading.Thread(target=run)
-                        th.start()
-                        while time.perf_counter() < t_rep:
-                            pass
-                ev0.record()
-                graphs[(7, 1)].replay()
-                ev1.record()
-                ev1.synchronize()
-                stats[cond].append(ev0.elapsed_time(ev1) * 1e3)
-                if th is not None:
-                    th.join()
-    res["G6"] = {c: pct(v) for c, v in stats.items()}
-    res["evict_resident_frac_mean"] = float(np.mean(evict_check)) if evict_check else None
-    res["leads_ms"] = leads
+    def set_inputs(g):
+        ids_b[:7].copy_(torch.from_numpy(g["ids"]))
+        qsl_b[:2].copy_(torch.from_numpy(g["qsl"]))
+        nctx_b[:1].copy_(torch.from_numpy(g["nctx"]))
+        torch.cuda.synchronize()
+
+    def replay_us(g):
+        ev0.record()
+        graphs[(7, 1)].replay()
+        ev1.record()
+        ev1.synchronize()
+        return ev0.elapsed_time(ev1) * 1e3
+
+    g6_loop(a, tab, dec, cold_frac, set_inputs, replay_us, res)
     return done(0)
 
 
