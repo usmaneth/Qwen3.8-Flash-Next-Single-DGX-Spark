@@ -120,7 +120,7 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S API_KEY
                     VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
                     MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE
-                    KERN_DECODE KERN_RPC LM_HEAD_FP8_RESCORE SHORTCONV_ASYNC_H2D)
+                    KERN_DECODE KERN_RPC LM_HEAD_FP8_RESCORE SHORTCONV_ASYNC_H2D MTP_DENSE_W8A16)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAP_$_v=\${$_v-}"
     eval "_SNAPSET_$_v=\${$_v+set}"
@@ -332,6 +332,9 @@ KERN_DECODE="${KERN_DECODE:-0}"
 KERN_RPC="${KERN_RPC:-0}"
 LM_HEAD_FP8_RESCORE="${LM_HEAD_FP8_RESCORE:-0}"
 SHORTCONV_ASYNC_H2D="${SHORTCONV_ASYNC_H2D:-0}"
+# R4: MTP_DENSE_W8A16=1 gives the dense drafter linears FP8 row-scaled
+# copies and a W8A16 kernel for M <= 32 (+0.09 GB; the BF16 weights stay).
+MTP_DENSE_W8A16="${MTP_DENSE_W8A16:-0}"
 # disable_eagle_block_drop (plan 2.4 / review §6.1): speculative-config lever
 # that removes MTP's fixed prefix-cache-block back-off per turn. MTP_NUM_...
 # > 0 and this knob = merge into the speculative-config JSON.
@@ -700,13 +703,15 @@ if [[ "$KERN_DECODE" == 1 ]]; then
     KERN_MOUNTS+=" -v $KERN_DIR/out/lm_head_fp8.py:$VLLM_PKG/models/qwen3_8_flash_next/nvidia/lm_head_fp8.py:ro"
     KERN_MOUNTS+=" -v $KERN_DIR/out/short_conv_attn.py:$KERN_SC_PKG:ro"
     KERN_MOUNTS+=" -v $KERN_DIR/out/kd_ext.py:/usr/local/lib/python3.12/dist-packages/kd_ext.py:ro"
+    KERN_MOUNTS+=" -v $KERN_DIR/out/mtp_w8a16.py:$VLLM_PKG/models/qwen3_8_flash_next/nvidia/mtp_w8a16.py:ro"
+    [[ "$MTP_DENSE_W8A16" == 1 ]] && KERN_MOUNTS+=" -e VLLM_MTP_DENSE_W8A16=1"
     [[ "$LM_HEAD_FP8_RESCORE" == 1 ]] && KERN_MOUNTS+=" -e VLLM_QWEN38_LM_HEAD_FP8=1"
     [[ "$SHORTCONV_ASYNC_H2D" == 1 ]] && KERN_MOUNTS+=" -e VLLM_SHORTCONV_ASYNC_H2D=1"
     if [[ "$KERN_RPC" == 1 ]]; then
         [[ "$BIND" == "127.0.0.1" ]] || err "KERN_RPC=1 needs BIND=127.0.0.1 (dev endpoints)"
         KERN_MOUNTS+=" -e VLLM_SERVER_DEV_MODE=1"
     fi
-elif [[ "$LM_HEAD_FP8_RESCORE" == 1 || "$SHORTCONV_ASYNC_H2D" == 1 || "$KERN_RPC" == 1 ]]; then
+elif [[ "$LM_HEAD_FP8_RESCORE" == 1 || "$SHORTCONV_ASYNC_H2D" == 1 || "$KERN_RPC" == 1 || "$MTP_DENSE_W8A16" == 1 ]]; then
     err "LM_HEAD_FP8_RESCORE, SHORTCONV_ASYNC_H2D and KERN_RPC need KERN_DECODE=1"
 fi
 
@@ -717,6 +722,7 @@ extract "$MTP_PKG" "$PATCHED_MTP.orig"
 python3 "$SCRIPT_DIR/files/patch_mtp_draft_vocab.py"
 [[ -f "$PATCHED_MTP" ]] || err "MTP patch missing after patch_mtp_draft_vocab.py"
 python3 "$SCRIPT_DIR/files/patch_mtp_fp8_head.py" || err "patch_mtp_fp8_head.py failed"
+[[ "$KERN_DECODE" == 1 ]] && { python3 "$SCRIPT_DIR/files/kern/patch_mtp_kern.py" || err "patch_mtp_kern.py failed"; }
 
 OFFLOAD_DIR="$SCRIPT_DIR/files/ple_offload"
 mkdir -p "$OFFLOAD_DIR/orig"
