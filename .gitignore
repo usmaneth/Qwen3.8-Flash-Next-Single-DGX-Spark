@@ -139,3 +139,4 @@
 !/files/ours/patch_weight_utils_window.py
 !/files/ours/patch_mtp_file_filter.py
 !/files/ours/patch_ple_offload_files.py
+!/files/ours/patch_routed_experts_lookup.py

@@ -260,6 +260,91 @@ class IteratorTests(unittest.TestCase):
               file=sys.stderr)
 
 
+# ------------------------------------------------------------------------- T4
+@unittest.skipUnless(HAVE_VLLM, "needs the image (vllm)")
+class ExpertLookupTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+        cls.RE = RoutedExperts
+        ns = load_functions(OURS / "routed_experts.py", {"_bf_expert_index", "_bf_expert_hits"})
+        cls.index = staticmethod(ns["_bf_expert_index"])
+        cls.hits = staticmethod(ns["_bf_expert_hits"])
+
+    def mapping(self, n, gate="gate_proj", up="up_proj", down="down_proj", lora=""):
+        return self.RE.build_expert_params_mapping(
+            gate, down, up, num_experts=n, routed_experts_prefix="",
+            lora_base_layer_prefix=lora, include_fused=True)
+
+    def stock(self, mapping, q):
+        return [m for m in mapping if m[1] in q]
+
+    def check(self, mapping, names):
+        idx = self.index(mapping)
+        self.assertIsNotNone(idx)
+        for q in names:
+            self.assertEqual(self.hits(idx, mapping, q), self.stock(mapping, q), q)
+
+    def edge_names(self, layer="language_model.model.layers.7.mlp.experts"):
+        out = []
+        for e in (0, 1, 11, 111, 511, 512, 5, 51):
+            for p in ("gate_proj", "up_proj", "down_proj", "gate_up_proj"):
+                for s in ("weight", "weight_scale", "weight_scale_2", "input_scale", "bias"):
+                    out.append(f"{layer}.{e}.{p}.{s}")
+        out += [f"{layer}.gate_up_proj.weight", f"{layer}.down_proj.weight",
+                f"{layer}.gate_up_proj_bias", f"{layer}.down_proj_bias",
+                f"{layer}.experts.3.down_proj.weight", "x.experts.1.experts.11.gate_proj.weight",
+                f"{layer}.1.gate_proj.base_layer.weight", "experts.", ""]
+        return out
+
+    def test_edges(self):
+        for n in (512, 513, 8):
+            self.check(self.mapping(n), self.edge_names())
+        self.check(self.mapping(16, "w1", "w3", "w2"),
+                   [n.replace("gate_proj", "w1").replace("up_proj", "w3").replace("down_proj", "w2")
+                    for n in self.edge_names()])
+        self.check(self.mapping(16, lora="base_layer."), self.edge_names())
+
+    def test_env_off(self):
+        os.environ["VLLM_EXPERT_LOOKUP"] = "0"
+        try:
+            self.assertIsNone(self.index(self.mapping(8)))
+        finally:
+            del os.environ["VLLM_EXPERT_LOOKUP"]
+
+    @unittest.skipUnless(HAVE_INDEX, "no index")
+    def test_real_index(self):
+        wm = globs.load_weight_map(SNAP)
+        mapping = self.mapping(512)
+        self.assertEqual(len(mapping), 2563)
+        pat = re.compile(r"^model\.language_model\.layers\.(\d+)\.mlp\.(experts\..*)$")
+        names = []
+        for n in wm:
+            m = pat.match(n)
+            if m:
+                names.append(f"language_model.model.layers.{m.group(1)}.mlp.{m.group(2)}")
+        mtp = re.compile(r"^mtp\.layers\.(\d+)\.mlp\.(experts\..*)$")
+        names += [f"model.layers.{m.group(1)}.mlp.{m.group(2)}" for n in wm if (m := mtp.match(n))]
+        self.assertGreater(len(names), 290_000)
+        idx = self.index(mapping)
+        t0 = time.time()
+        new = [self.hits(idx, mapping, q) for q in names]
+        t1 = time.time()
+        old = [self.stock(mapping, q) for q in names[:20000]]
+        t2 = time.time()
+        self.assertEqual(new[:20000], old)
+        # The full stock scan is slow; check all names in parts of 20k.
+        for s in range(20000, len(names), 20000):
+            part = names[s : s + 20000]
+            self.assertEqual(new[s : s + 20000], [self.stock(mapping, q) for q in part])
+        self.assertTrue(all(new), "a real expert name matched no entry")
+        per_new = (t1 - t0) / len(names) * 1e6
+        per_old = (t2 - t1) / 20000 * 1e6
+        print(f"\nT4 real: {len(names)} names; match cost {per_old:.1f} us (stock scan) vs "
+              f"{per_new:.2f} us (index) per tensor; stock total ~{per_old * len(names) / 1e6:.0f}s",
+              file=sys.stderr)
+
+
 # ------------------------------------------------------------ patch structure
 def _top(path):
     return {getattr(n, "name", None): n for n in ast.parse(Path(path).read_text()).body

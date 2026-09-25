@@ -766,6 +766,12 @@ if [[ "$BOOT_FAST_WINDOW$BOOT_FAST_MTP_FILES$BOOT_FAST_PLE_FILES$BOOT_FAST_EXPER
         BF_DOCKER_ARGS+=" -e 'VLLM_PLE_OFFLOAD_FILE_GLOB=$BF_PLE_GLOB'"
         info "  R6 offload files: $BF_PLE_GLOB"
     fi
+    if [[ "$BOOT_FAST_EXPERT_LOOKUP" == "1" ]]; then
+        extract "$VLLM_PKG/model_executor/layers/fused_moe/routed_experts.py" "$OURS/routed_experts.py.orig"
+        python3 "$OURS/patch_routed_experts_lookup.py" >/dev/null || err "patch_routed_experts_lookup.py failed"
+        _bf_mount "$OURS/routed_experts.py" model_executor/layers/fused_moe/routed_experts.py
+        info "  R4 expert lookup: on"
+    fi
     if [[ "$BOOT_TRACE" == "1" ]]; then
         mkdir -p "$BOOT_TRACE_DIR"
         BF_DOCKER_ARGS+=" -v $BOOT_TRACE_DIR:/root/boot-trace -e VLLM_ST_TRACE_DIR=/root/boot-trace"
