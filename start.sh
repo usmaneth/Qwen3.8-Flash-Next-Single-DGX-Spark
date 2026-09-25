@@ -123,7 +123,7 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     BOOT_FAST BOOT_FAST_WINDOW BOOT_FAST_WINDOW_FILES BOOT_FAST_WINDOW_METHOD
                     BOOT_FAST_WINDOW_THREADS BOOT_FAST_WINDOW_FLOOR_GIB BOOT_FAST_WINDOW_MODE BOOT_FAST_BUFFER_PINNED BOOT_FAST_EXPERT_LOOKUP
                     BOOT_FAST_MTP_FILES BOOT_FAST_PLE_FILES BOOT_FAST_SKIP_MM_WARMUP
-                    BOOT_FAST_MTP_ALLOW BOOT_FAST_PREFLIGHT_CACHE BOOT_HASH BOOT_HASH_DIR BOOT_TRACE BOOT_TRACE_DIR)
+                    BOOT_FAST_MTP_ALLOW BOOT_FAST_PREFLIGHT_CACHE BOOT_FAST_EVICT BOOT_HASH BOOT_HASH_DIR BOOT_TRACE BOOT_TRACE_DIR)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAP_$_v=\${$_v-}"
     eval "_SNAPSET_$_v=\${$_v+set}"
@@ -738,6 +738,31 @@ if [[ "$BOOT_FAST_WINDOW$BOOT_FAST_MTP_FILES$BOOT_FAST_PLE_FILES$BOOT_FAST_EXPER
         extract "$VLLM_PKG/model_executor/model_loader/weight_utils.py" "$OURS/weight_utils.py.orig"
         python3 "$OURS/patch_weight_utils_window.py" >/dev/null || err "patch_weight_utils_window.py failed"
         _bf_mount "$OURS/weight_utils.py" model_executor/model_loader/weight_utils.py
+    fi
+    # R3b reads with O_DIRECT, so cached checkpoint pages give no gain. They
+    # can only hurt: L1 b5 (2026-09-25) had 74 GiB of checkpoint pages in the
+    # cache, the 74 GiB parameter allocation took MemFree to 0.9 GiB, and the
+    # PLE offload worker failed with a CUDA OOM. Drop only the checkpoint
+    # files from the page cache (POSIX_FADV_DONTNEED), not the global cache.
+    if [[ "$BOOT_FAST_WINDOW" == "1" && "$BOOT_FAST_WINDOW_MODE" == "buffer" && "${BOOT_FAST_EVICT:-1}" == "1" ]]; then
+        _BF_EVICT=$(python3 - "$MODEL_PATH/$SNAPSHOT_REL" <<'PYEOF' 2>&1
+import glob, os, sys
+n = b = 0
+for p in sorted(glob.glob(os.path.join(sys.argv[1], "*.safetensors"))):
+    try:
+        fd = os.open(p, os.O_RDONLY)
+    except OSError:
+        continue
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        n += 1
+        b += os.fstat(fd).st_size
+    finally:
+        os.close(fd)
+print(f"{n} files, {b / 2**30:.1f} GiB")
+PYEOF
+)
+        info "  R3b: checkpoint pages dropped from the page cache ($_BF_EVICT)"
     fi
     if [[ "$BOOT_FAST_WINDOW" == "1" ]]; then
         # The window reads ahead every file that the iterator opens. Without
