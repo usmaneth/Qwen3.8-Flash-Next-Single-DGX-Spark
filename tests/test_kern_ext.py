@@ -330,3 +330,62 @@ def test_patch_ple_kern_applies_and_is_idempotent(tmp_path):
     # knob off: every change sits behind _GPU_WAIT
     assert '_GPU_WAIT = os.environ.get("VLLM_PLE_GPU_WAIT", "0") == "1"' in once["worker.py"]
     assert "staging_bufs=self._kd_make_staging() if _GPU_WAIT else None" in once["connector.py"]
+
+
+def test_kd_set_off_knob_without_build_is_noop(kd):
+    r, _ = make_runner()
+    w = kd.KDExt()
+    w.model_runner = r
+    res = w.kd_set(json.dumps({"mtp_w4": 0, "skinny": 0, "ple_gpu_wait": 0, "mtp_norm": 0,
+                               "attr": {"no_such_module_x:FLAG": False}}))
+    assert set(res["done"]["absent_off"]) >= {"mtp_w4", "skinny", "ple_gpu_wait", "mtp_norm"}
+    with pytest.raises(RuntimeError):
+        w.kd_set(json.dumps({"skinny": 1}))
+
+
+@pytest.mark.parametrize("plan,builds", [
+    ("/models/usman/kern-decode/plans/l4-r3a2-r8-r6.json", ("w8", "head", "ple", "skinny", "norm")),
+    ("/models/usman/kern-decode/plans/l3-gates-det.json", ("w8", "head", "ple", "skinny")),
+])
+def test_plan_arms_apply(kd, monkeypatch, plan, builds):
+    """Every arm of a queued plan passes kd_set with the builds of its launch."""
+    if not os.path.exists(plan):
+        pytest.skip("plan not present")
+    import dataclasses
+
+    @dataclasses.dataclass(frozen=True)
+    class S:
+        max_rows: int = 64
+        topk: int = 64
+
+    class Qwen38Fp8LMHeadMethod:
+        def __init__(self):
+            self.w8 = object()
+            self.settings = S()
+
+    r, _ = make_runner()
+    r.model.quant_method = Qwen38Fp8LMHeadMethod()
+    r.capture_model = lambda: r.speculator.decode_cudagraph_manager.graphs.update({1: object()})
+    r.cudagraph_manager.graphs = {}
+    r.speculator.prefill_cudagraph_manager.graphs = {}
+    mods = {"vllm.v1.attention.backends.short_conv_attn": {"_ASYNC_H2D": False}}
+    if "w8" in builds:
+        mods["vllm.models.qwen3_8_flash_next.nvidia.mtp_w8a16"] = {"_ON": True, "_W4_ON": False, "_BUILD_W4": False, "_NORM_ON": False}
+    if "head" in builds:
+        mods["vllm.models.qwen3_8_flash_next.nvidia.mtp"] = {"_KERN_HEAD_W4_ON": True}
+    if "ple" in builds:
+        mods["vllm.v1.ple_offload.connector"] = {"_GPU_WAIT": True, "_GPU_WAIT_ON": True}
+    if "skinny" in builds:
+        mods["vllm.models.qwen3_8_flash_next.nvidia.skinny_bf16"] = {"_ON": True}
+    for name, attrs in mods.items():
+        m = types.ModuleType(name)
+        for k, v in attrs.items():
+            setattr(m, k, v)
+        monkeypatch.setitem(sys.modules, name, m)
+    monkeypatch.setenv("VLLM_MTP_FUSED_NORM", "1" if "norm" in builds else "0")
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    w = kd.KDExt()
+    w.model_runner = r
+    arms = json.load(open(plan))["arms"]
+    for name, knobs in arms.items():
+        w.kd_set(json.dumps(knobs))

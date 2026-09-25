@@ -260,8 +260,31 @@ class KDExt:
         return info
 
     def kd_set(self, spec_json):
-        """Apply knobs from a JSON object; return kd_info() after the change."""
+        """Apply knobs from a JSON object; return kd_info() after the change.
+
+        A knob set to 0/false whose build is absent in this launch is a
+        no-op (that path cannot run); a knob set to 1 without its build
+        raises.
+        """
         knobs = json.loads(spec_json) if isinstance(spec_json, str) else dict(spec_json)
+        absent = []
+        builds = {
+            "ple_gpu_wait": lambda: getattr(sys.modules.get("vllm.v1.ple_offload.connector"), "_GPU_WAIT", False),
+            "mtp_w8": lambda: "vllm.models.qwen3_8_flash_next.nvidia.mtp_w8a16" in sys.modules,
+            "mtp_w4": lambda: getattr(sys.modules.get("vllm.models.qwen3_8_flash_next.nvidia.mtp_w8a16"),
+                                      "_BUILD_W4", False),
+            "mtp_norm": lambda: os.environ.get("VLLM_MTP_FUSED_NORM", "0") == "1",
+            "skinny": lambda: "vllm.models.qwen3_8_flash_next.nvidia.skinny_bf16" in sys.modules,
+        }
+        for k, built in builds.items():
+            if k in knobs and not knobs[k] and not built():
+                knobs.pop(k)
+                absent.append(k)
+        for key in list((knobs.get("attr") or {})):
+            mname, aname = key.split(":")
+            if not knobs["attr"][key] and not hasattr(sys.modules.get(mname), aname):
+                knobs["attr"].pop(key)
+                absent.append(key)
         r = self._kd_runner()
         st = self._kd_state()
         done = {}
@@ -329,6 +352,7 @@ class KDExt:
             done[key] = val
         if knobs.get("recapture"):
             done["recapture_s"] = self._kd_recapture()
+        done["absent_off"] = absent
         return {"done": done, "info": self.kd_info()}
 
     def _kd_fi_tactic(self, rules):
