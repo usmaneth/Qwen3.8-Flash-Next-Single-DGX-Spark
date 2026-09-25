@@ -120,7 +120,7 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S API_KEY
                     VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
                     MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE
-                    KERN_DECODE KERN_RPC LM_HEAD_FP8_RESCORE SHORTCONV_ASYNC_H2D MTP_DENSE_W8A16 PLE_GPU_WAIT MTP_DENSE_W4A16 MTP_DRAFT_HEAD_W4 KERN_SKINNY MTP_FUSED_NORM)
+                    KERN_DECODE KERN_RPC LM_HEAD_FP8_RESCORE SHORTCONV_ASYNC_H2D MTP_DENSE_W8A16 PLE_GPU_WAIT MTP_DENSE_W4A16 MTP_DRAFT_HEAD_W4 KERN_SKINNY MTP_FUSED_NORM QSA_FUSED_DRAFT)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAP_$_v=\${$_v-}"
     eval "_SNAPSET_$_v=\${$_v+set}"
@@ -349,6 +349,10 @@ MTP_DRAFT_HEAD_W4="${MTP_DRAFT_HEAD_W4:-0}"
 # R6: KERN_SKINNY=1 routes the router, GDN ba and HC linears of the target
 # through a skinny BF16 GEMM for M <= 16 (files/kern/skinny_bf16.py).
 KERN_SKINNY="${KERN_SKINNY:-0}"
+# R21: QSA_FUSED_DRAFT=1 lets the drafter capture the 1-token draft passes
+# 1..K-1 as one CUDA graph (the QSA metadata builder refreshes its metadata
+# inside the graph). kd_ext knob fused_draft switches it at run time.
+QSA_FUSED_DRAFT="${QSA_FUSED_DRAFT:-0}"
 # disable_eagle_block_drop (plan 2.4 / review §6.1): speculative-config lever
 # that removes MTP's fixed prefix-cache-block back-off per turn. MTP_NUM_...
 # > 0 and this knob = merge into the speculative-config JSON.
@@ -712,10 +716,14 @@ if [[ "$KERN_DECODE" == 1 ]]; then
     KERN_SC_PKG="$VLLM_PKG/v1/attention/backends/short_conv_attn.py"
     extract "$KERN_MODEL_PKG" "$KERN_DIR/orig/nvidia_model.py"
     extract "$KERN_SC_PKG" "$KERN_DIR/orig/short_conv_attn.py"
+    KERN_QSA_CACHE_PKG="$VLLM_PKG/models/qwen3_8_flash_next/common/qsa_cache.py"
+    extract "$KERN_QSA_CACHE_PKG" "$KERN_DIR/orig/qsa_cache.py"
     python3 "$KERN_DIR/gen_kern.py" --orig "$KERN_DIR/orig" --out "$KERN_DIR/out" || err "gen_kern.py failed"
     KERN_MOUNTS="-v $KERN_DIR/out/nvidia_model.py:$KERN_MODEL_PKG:ro"
     KERN_MOUNTS+=" -v $KERN_DIR/out/lm_head_fp8.py:$VLLM_PKG/models/qwen3_8_flash_next/nvidia/lm_head_fp8.py:ro"
     KERN_MOUNTS+=" -v $KERN_DIR/out/short_conv_attn.py:$KERN_SC_PKG:ro"
+    KERN_MOUNTS+=" -v $KERN_DIR/out/qsa_cache.py:$KERN_QSA_CACHE_PKG:ro"
+    [[ "$QSA_FUSED_DRAFT" == 1 ]] && KERN_MOUNTS+=" -e VLLM_QSA_FUSED_DRAFT=1"
     KERN_MOUNTS+=" -v $KERN_DIR/out/kd_ext.py:/usr/local/lib/python3.12/dist-packages/kd_ext.py:ro"
     KERN_MOUNTS+=" -v $KERN_DIR/out/mtp_w8a16.py:$VLLM_PKG/models/qwen3_8_flash_next/nvidia/mtp_w8a16.py:ro"
     [[ "$MTP_DENSE_W8A16" == 1 ]] && KERN_MOUNTS+=" -e VLLM_MTP_DENSE_W8A16=1"

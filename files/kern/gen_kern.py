@@ -22,6 +22,14 @@ kd_ext knob turns it on, so the knob-off behavior is the image behavior.
                         the same idea as upstream vLLM #55054).
   out/kd_ext.py         the worker extension (runtime knobs and the step
                         timer), a byte copy of files/kern/kd_ext.py.
+  out/qsa_cache.py      models/qwen3_8_flash_next/common/qsa_cache.py
+                        R21 (fused multi-step draft graph): with
+                        VLLM_QSA_FUSED_DRAFT=1 the QSA metadata builder
+                        declares supports_draft_decode_metadata_update and
+                        re-launches its metadata kernel between the draft
+                        steps, so the speculator captures the 1-token draft
+                        passes 1..K-1 as one CUDA graph (the add-only diff of
+                        the recipe file files/ours/qsa_cache.py).
 
     python3 gen_kern.py --orig files/kern/orig --out files/kern/out
 """
@@ -140,10 +148,92 @@ def patch_short_conv(text: str) -> str:
     return out
 
 
+# ------------------------------------------------------------ R21 qsa_cache.py
+R21_MARK = "VLLM_QSA_FUSED_DRAFT"
+R21_PAIRS = [
+    ("import math\nfrom dataclasses import dataclass\n",
+     "import math\nimport os\nfrom dataclasses import dataclass\n"),
+    ("        self.storage_block_size = kv_cache_spec.storage_block_size\n"
+     "        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens\n",
+     "        self.storage_block_size = kv_cache_spec.storage_block_size\n"
+     "        # R21 (kern-decode): fused multi-step draft decode. Every build()\n"
+     "        # input is a persistent buffer that the speculator advances in\n"
+     "        # place between the draft steps, and every scalar argument is the\n"
+     "        # same for those steps. So a refresh is one more launch of the same\n"
+     "        # metadata kernel into the same buffers. Off by default.\n"
+     "        self.supports_draft_decode_metadata_update = (\n"
+     "            os.environ.get(\"VLLM_QSA_FUSED_DRAFT\", \"0\") == \"1\"\n"
+     "        )\n"
+     "        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens\n"),
+    ("        token_to_req, logical_positions, slot_mapping = build_qsa_metadata(\n"
+     "            common_attn_metadata,\n"
+     "            self.token_to_req_buffer,\n"
+     "            self.logical_positions_buffer,\n"
+     "            self.slot_mapping_buffer,\n"
+     "            storage_block_size=self.storage_block_size,\n",
+     "        rebuild_kwargs = dict(\n"
+     "            storage_block_size=self.storage_block_size,\n"),
+    ("            k_work_metadata_buffer=k_work_metadata if build_k_work else None,\n"
+     "            request_capacity=request_capacity,\n"
+     "        )\n"
+     "        return QSAForwardMetadata(\n",
+     "            k_work_metadata_buffer=k_work_metadata if build_k_work else None,\n"
+     "            request_capacity=request_capacity,\n"
+     "        )\n"
+     "        token_to_req, logical_positions, slot_mapping = build_qsa_metadata(\n"
+     "            common_attn_metadata,\n"
+     "            self.token_to_req_buffer,\n"
+     "            self.logical_positions_buffer,\n"
+     "            self.slot_mapping_buffer,\n"
+     "            **rebuild_kwargs,\n"
+     "        )\n"
+     "        if self.supports_draft_decode_metadata_update:\n"
+     "            self._draft_rebuild = (common_attn_metadata, rebuild_kwargs)\n"
+     "        return QSAForwardMetadata(\n"),
+    ("            num_actual_tokens=num_tokens,\n"
+     "            storage_block_size=self.storage_block_size,\n"
+     "            compress_ratio=self.compress_ratio,\n"
+     "        )\n",
+     "            num_actual_tokens=num_tokens,\n"
+     "            storage_block_size=self.storage_block_size,\n"
+     "            compress_ratio=self.compress_ratio,\n"
+     "        )\n"
+     "\n"
+     "    def update_draft_decode_metadata(self, metadata: QSAForwardMetadata) -> None:\n"
+     "        \"\"\"R21: refresh the step-dependent QSA metadata for the next draft step.\n"
+     "\n"
+     "        The call launches the metadata kernel again with the arguments of the\n"
+     "        last build(). Its inputs (query_start_loc, seq_lens, slot_mapping,\n"
+     "        block table) are the persistent buffers that the speculator advanced\n"
+     "        in place. Its outputs are the persistent buffers of this builder,\n"
+     "        which ``metadata`` already references. There is no host sync, so the\n"
+     "        call is safe inside a CUDA graph capture.\n"
+     "        \"\"\"\n"
+     "        del metadata\n"
+     "        common_attn_metadata, rebuild_kwargs = self._draft_rebuild\n"
+     "        build_qsa_metadata(\n"
+     "            common_attn_metadata,\n"
+     "            self.token_to_req_buffer,\n"
+     "            self.logical_positions_buffer,\n"
+     "            self.slot_mapping_buffer,\n"
+     "            **rebuild_kwargs,\n"
+     "        )\n"),
+]
+
+
+def patch_qsa_cache(text: str) -> str:
+    if R21_MARK in text:
+        raise ValueError("qsa_cache.py: already patched")
+    out = _apply(text, R21_PAIRS, "qsa_cache.py")
+    ast.parse(out)
+    return out
+
+
 # (orig file name, output name, function)
 JOBS = [
     ("nvidia_model.py", "nvidia_model.py", patch_model),
     ("short_conv_attn.py", "short_conv_attn.py", patch_short_conv),
+    ("qsa_cache.py", "qsa_cache.py", patch_qsa_cache),
 ]
 COPIES = ["lm_head_fp8.py", "kd_ext.py", "mtp_w8a16.py", "ple_gpu_wait.py", "w4a16.py", "skinny_bf16.py"]
 

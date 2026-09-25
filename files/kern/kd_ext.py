@@ -30,6 +30,11 @@ with the matching env var would run it:
                in the PLE layer waits; 0 = the recipe host wait.
   mtp_w8       R4. mtp_w8a16._ON (VLLM_MTP_DENSE_W8A16=1 at launch). The
                drafter graphs bake the path in: set recapture with it.
+  fused_draft  R21. speculator.use_fused_multi_step_decode: 1 = the 1-token
+               draft passes 1..K-1 run as ONE decode graph (the QSA builder
+               refreshes its metadata inside the graph); 0 = one graph per
+               pass. Needs VLLM_QSA_FUSED_DRAFT=1 at launch. The graphs bake
+               the path in: set recapture with it.
   attr         {"module:attr": value}: set a module attribute of a kern
                patch (the flags of later rungs).
   recapture    true: capture all CUDA graphs again (target and drafter).
@@ -211,6 +216,10 @@ class _StepTimer:
         return out
 
 
+def _fused_draft_built():
+    return os.environ.get("VLLM_QSA_FUSED_DRAFT", "0") == "1"
+
+
 def _find_fp8_head(model):
     for m in model.modules():
         qm = getattr(m, "quant_method", None)
@@ -254,6 +263,8 @@ class KDExt:
         info["sc_async"] = getattr(sc, "_ASYNC_H2D", None)
         con = sys.modules.get("vllm.v1.ple_offload.connector")
         info["ple_gpu_wait"] = getattr(con, "_GPU_WAIT_ON", None) if getattr(con, "_GPU_WAIT", False) else None
+        info["fused_draft"] = (getattr(spec, "use_fused_multi_step_decode", None)
+                               if _fused_draft_built() else None)
         w8 = sys.modules.get("vllm.models.qwen3_8_flash_next.nvidia.mtp_w8a16")
         info["mtp_w8"] = getattr(w8, "_ON", None)
         info["mtp_w4"] = getattr(w8, "_W4_ON", None) if getattr(w8, "_BUILD_W4", False) else None
@@ -275,6 +286,7 @@ class KDExt:
                                       "_BUILD_W4", False),
             "mtp_norm": lambda: os.environ.get("VLLM_MTP_FUSED_NORM", "0") == "1",
             "skinny": lambda: "vllm.models.qwen3_8_flash_next.nvidia.skinny_bf16" in sys.modules,
+            "fused_draft": _fused_draft_built,
         }
         for k, built in builds.items():
             if k in knobs and not knobs[k] and not built():
@@ -341,6 +353,20 @@ class KDExt:
                 raise RuntimeError("skinny: needs VLLM_KERN_SKINNY=1 at launch")
             mod._ON = bool(knobs["skinny"])
             done["skinny"] = mod._ON
+        if "fused_draft" in knobs:
+            spec = getattr(r, "speculator", None)
+            if spec is None or not _fused_draft_built():
+                raise RuntimeError("fused_draft: needs VLLM_QSA_FUSED_DRAFT=1 at launch")
+            on = bool(knobs["fused_draft"])
+            if on:
+                bad = sorted({g.backend.get_name() for gs in spec.attn_groups for g in gs
+                              if not g.supports_draft_decode_metadata_update})
+                if bad:
+                    raise RuntimeError(f"fused_draft: backends without the draft update: {bad}")
+                if spec.num_speculative_steps < 2:
+                    raise RuntimeError("fused_draft: needs at least 2 speculative steps")
+            spec.use_fused_multi_step_decode = on
+            done["fused_draft"] = on
         if "fi_tactic" in knobs:
             done["fi_tactic"] = self._kd_fi_tactic(knobs["fi_tactic"])
         for key, val in (knobs.get("attr") or {}).items():

@@ -32,7 +32,8 @@ def gen_out(tmp_path_factory):
     orig = tmp_path_factory.mktemp("orig")
     out = tmp_path_factory.mktemp("out")
     for rel, name in (("models/qwen3_8_flash_next/nvidia/model.py", "nvidia_model.py"),
-                      ("v1/attention/backends/short_conv_attn.py", "short_conv_attn.py")):
+                      ("v1/attention/backends/short_conv_attn.py", "short_conv_attn.py"),
+                      ("models/qwen3_8_flash_next/common/qsa_cache.py", "qsa_cache.py")):
         with open(os.path.join(SRC, rel)) as f, open(orig / name, "w") as g:
             g.write(f.read())
     r = subprocess.run([sys.executable, os.path.join(KERN, "gen_kern.py"), "--orig", str(orig),
@@ -68,11 +69,42 @@ def test_gen_short_conv_default_blocking(gen_out):
 
 def test_gen_refuses_patched_input(gen_out, tmp_path):
     _, out = gen_out
-    for n in ("nvidia_model.py", "short_conv_attn.py"):
+    for n in ("nvidia_model.py", "short_conv_attn.py", "qsa_cache.py"):
         (tmp_path / n).write_text((out / n).read_text())
     r = subprocess.run([sys.executable, os.path.join(KERN, "gen_kern.py"), "--orig", str(tmp_path),
                         "--out", str(tmp_path / "o")], capture_output=True, text=True)
     assert r.returncode == 1 and "already patched" in r.stderr
+
+
+def test_gen_qsa_cache_default_off(gen_out):
+    orig, out = gen_out
+    a = (orig / "qsa_cache.py").read_text()
+    b = (out / "qsa_cache.py").read_text()
+    assert 'os.environ.get("VLLM_QSA_FUSED_DRAFT", "0") == "1"' in b
+    assert "def update_draft_decode_metadata" in b
+    # The flag-off build() makes the same build_qsa_metadata call: the same
+    # keyword values, now passed through one dict.
+    for kw in ("storage_block_size=self.storage_block_size,",
+               "compress_ratio=self.compress_ratio,",
+               "k_work_metadata_buffer=k_work_metadata if build_k_work else None,",
+               "request_capacity=request_capacity,"):
+        assert kw in a and kw in b
+    assert b.count("build_qsa_metadata(") == a.count("build_qsa_metadata(") + 1
+
+
+def test_gen_qsa_cache_builder_flag(gen_out, monkeypatch):
+    """The patched builder: the flag follows the env var, build() stores the
+    rebuild arguments only when the flag is on, and the update call launches
+    the metadata kernel with exactly the arguments of the last build()."""
+    _, out = gen_out
+    src = (out / "qsa_cache.py").read_text()
+    tree = __import__("ast").parse(src)
+    cls = next(n for n in tree.body if getattr(n, "name", "") == "QSAMetadataBuilder")
+    names = [f.name for f in cls.body if hasattr(f, "name")]
+    assert "update_draft_decode_metadata" in names
+    upd = next(f for f in cls.body if getattr(f, "name", "") == "update_draft_decode_metadata")
+    txt = __import__("ast").unparse(upd)
+    assert "self._draft_rebuild" in txt and "**rebuild_kwargs" in txt
 
 
 # ------------------------------------------------------------ fake CUDA events
@@ -389,3 +421,30 @@ def test_plan_arms_apply(kd, monkeypatch, plan, builds):
     arms = json.load(open(plan))["arms"]
     for name, knobs in arms.items():
         w.kd_set(json.dumps(knobs))
+
+
+def test_kd_set_fused_draft(kd, monkeypatch):
+    r, _ = make_runner()
+    ok = types.SimpleNamespace(supports_draft_decode_metadata_update=True,
+                               backend=types.SimpleNamespace(get_name=lambda: "QSA"))
+    r.speculator.attn_groups = [[ok]]
+    r.speculator.num_speculative_steps = 6
+    r.speculator.use_fused_multi_step_decode = False
+    w = kd.KDExt()
+    w.model_runner = r
+    monkeypatch.delenv("VLLM_QSA_FUSED_DRAFT", raising=False)
+    # off without the build: a no-op; on without the build: an error
+    assert "fused_draft" in w.kd_set(json.dumps({"fused_draft": 0}))["done"]["absent_off"]
+    with pytest.raises(RuntimeError):
+        w.kd_set(json.dumps({"fused_draft": 1}))
+    monkeypatch.setenv("VLLM_QSA_FUSED_DRAFT", "1")
+    res = w.kd_set(json.dumps({"fused_draft": 1}))
+    assert r.speculator.use_fused_multi_step_decode is True
+    assert res["info"]["fused_draft"] is True
+    w.kd_set(json.dumps({"fused_draft": 0}))
+    assert r.speculator.use_fused_multi_step_decode is False
+    bad = types.SimpleNamespace(supports_draft_decode_metadata_update=False,
+                                backend=types.SimpleNamespace(get_name=lambda: "OTHER"))
+    r.speculator.attn_groups = [[ok, bad]]
+    with pytest.raises(RuntimeError, match="OTHER"):
+        w.kd_set(json.dumps({"fused_draft": 1}))
