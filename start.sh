@@ -1167,7 +1167,7 @@ LOGPID=$!
 WAIT_START=$(date +%s)
 _last_hb=0
 while true; do
-    sleep 10
+    sleep 1
     NOW=$(date +%s)
     ELAPSED=$((NOW - WAIT_START))
     if [[ "$ELAPSED" -gt "$READY_TIMEOUT_S" ]]; then
