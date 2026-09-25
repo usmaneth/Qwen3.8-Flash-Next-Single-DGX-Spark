@@ -305,6 +305,12 @@ class KDExt:
                 raise RuntimeError("mtp_w4: needs VLLM_MTP_DENSE_W4A16=1 at launch")
             mod._W4_ON = bool(knobs["mtp_w4"])
             done["mtp_w4"] = mod._W4_ON
+        if "skinny" in knobs:
+            mod = sys.modules.get("vllm.models.qwen3_8_flash_next.nvidia.skinny_bf16")
+            if mod is None:
+                raise RuntimeError("skinny: needs VLLM_KERN_SKINNY=1 at launch")
+            mod._ON = bool(knobs["skinny"])
+            done["skinny"] = mod._ON
         for key, val in (knobs.get("attr") or {}).items():
             mname, aname = key.split(":")
             mod = importlib.import_module(mname)

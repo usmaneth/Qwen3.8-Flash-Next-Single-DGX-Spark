@@ -55,7 +55,13 @@ R5_PAIRS = [
         "            # (lm_head_fp8.py). It is off by default.\n"
         f"            {R5_MARK}\n"
         "\n"
-        "            enable_fp8_lm_head(self)\n",
+        "            enable_fp8_lm_head(self)\n"
+        '        if os.environ.get("VLLM_KERN_SKINNY", "0") == "1":\n'
+        "            # R6: skinny BF16 GEMM for the small-N decode linears\n"
+        "            # (skinny_bf16.py). It is off by default.\n"
+        "            from .skinny_bf16 import enable_skinny\n"
+        "\n"
+        "            enable_skinny(self)\n",
     ),
 ]
 
@@ -139,7 +145,7 @@ JOBS = [
     ("nvidia_model.py", "nvidia_model.py", patch_model),
     ("short_conv_attn.py", "short_conv_attn.py", patch_short_conv),
 ]
-COPIES = ["lm_head_fp8.py", "kd_ext.py", "mtp_w8a16.py", "ple_gpu_wait.py", "w4a16.py"]
+COPIES = ["lm_head_fp8.py", "kd_ext.py", "mtp_w8a16.py", "ple_gpu_wait.py", "w4a16.py", "skinny_bf16.py"]
 
 
 def main() -> int:

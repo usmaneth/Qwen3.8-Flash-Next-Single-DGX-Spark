@@ -120,7 +120,7 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S API_KEY
                     VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
                     MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE
-                    KERN_DECODE KERN_RPC LM_HEAD_FP8_RESCORE SHORTCONV_ASYNC_H2D MTP_DENSE_W8A16 PLE_GPU_WAIT MTP_DENSE_W4A16 MTP_DRAFT_HEAD_W4)
+                    KERN_DECODE KERN_RPC LM_HEAD_FP8_RESCORE SHORTCONV_ASYNC_H2D MTP_DENSE_W8A16 PLE_GPU_WAIT MTP_DENSE_W4A16 MTP_DRAFT_HEAD_W4 KERN_SKINNY)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAP_$_v=\${$_v-}"
     eval "_SNAPSET_$_v=\${$_v+set}"
@@ -343,6 +343,9 @@ PLE_GPU_WAIT="${PLE_GPU_WAIT:-0}"
 MTP_DENSE_W4A16="${MTP_DENSE_W4A16:-0}"
 # R8: MTP_DRAFT_HEAD_W4=1 adds a 4-bit copy of the reduced draft head.
 MTP_DRAFT_HEAD_W4="${MTP_DRAFT_HEAD_W4:-0}"
+# R6: KERN_SKINNY=1 routes the router, GDN ba and HC linears of the target
+# through a skinny BF16 GEMM for M <= 16 (files/kern/skinny_bf16.py).
+KERN_SKINNY="${KERN_SKINNY:-0}"
 # disable_eagle_block_drop (plan 2.4 / review §6.1): speculative-config lever
 # that removes MTP's fixed prefix-cache-block back-off per turn. MTP_NUM_...
 # > 0 and this knob = merge into the speculative-config JSON.
@@ -716,6 +719,8 @@ if [[ "$KERN_DECODE" == 1 ]]; then
     KERN_MOUNTS+=" -v $KERN_DIR/out/w4a16.py:$VLLM_PKG/models/qwen3_8_flash_next/nvidia/w4a16.py:ro"
     [[ "$MTP_DENSE_W4A16" == 1 ]] && KERN_MOUNTS+=" -e VLLM_MTP_DENSE_W4A16=1"
     [[ "$MTP_DRAFT_HEAD_W4" == 1 ]] && KERN_MOUNTS+=" -e VLLM_MTP_DRAFT_HEAD_W4=1"
+    KERN_MOUNTS+=" -v $KERN_DIR/out/skinny_bf16.py:$VLLM_PKG/models/qwen3_8_flash_next/nvidia/skinny_bf16.py:ro"
+    [[ "$KERN_SKINNY" == 1 ]] && KERN_MOUNTS+=" -e VLLM_KERN_SKINNY=1"
     KERN_MOUNTS+=" -v $KERN_DIR/out/ple_gpu_wait.py:$VLLM_PKG/model_executor/layers/ple_gpu_wait.py:ro"
     [[ "$PLE_GPU_WAIT" == 1 ]] && KERN_MOUNTS+=" -e VLLM_PLE_GPU_WAIT=1"
     [[ "$LM_HEAD_FP8_RESCORE" == 1 ]] && KERN_MOUNTS+=" -e VLLM_QWEN38_LM_HEAD_FP8=1"
