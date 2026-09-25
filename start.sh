@@ -758,6 +758,14 @@ if [[ "$BOOT_FAST_WINDOW$BOOT_FAST_MTP_FILES$BOOT_FAST_PLE_FILES$BOOT_FAST_EXPER
         fi
         info "  R2 drafter files: $BF_MTP_GLOB"
     fi
+    if [[ "$BOOT_FAST_PLE_FILES" == "1" || "$BOOT_HASH" == "1" ]]; then
+        python3 "$OURS/patch_ple_offload_files.py" >/dev/null || err "patch_ple_offload_files.py failed"
+    fi
+    if [[ "$BOOT_FAST_PLE_FILES" == "1" ]]; then
+        [[ -n "$BF_PLE_GLOB" ]] || err "BOOT_FAST_PLE_FILES=1 but the index gives no PLE offload glob."
+        BF_DOCKER_ARGS+=" -e 'VLLM_PLE_OFFLOAD_FILE_GLOB=$BF_PLE_GLOB'"
+        info "  R6 offload files: $BF_PLE_GLOB"
+    fi
     if [[ "$BOOT_TRACE" == "1" ]]; then
         mkdir -p "$BOOT_TRACE_DIR"
         BF_DOCKER_ARGS+=" -v $BOOT_TRACE_DIR:/root/boot-trace -e VLLM_ST_TRACE_DIR=/root/boot-trace"

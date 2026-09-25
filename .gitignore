@@ -138,3 +138,4 @@
 !/tests/test_boot_fast.py
 !/files/ours/patch_weight_utils_window.py
 !/files/ours/patch_mtp_file_filter.py
+!/files/ours/patch_ple_offload_files.py
