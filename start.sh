@@ -119,7 +119,11 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     EXTRA_VLLM_ARGS EXTRA_DOCKER_ARGS NATIVE_MAX_MODEL_LEN
                     YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S API_KEY
                     VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
-                    MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE)
+                    MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE
+                    BOOT_FAST BOOT_FAST_WINDOW BOOT_FAST_WINDOW_FILES BOOT_FAST_WINDOW_METHOD
+                    BOOT_FAST_WINDOW_THREADS BOOT_FAST_WINDOW_FLOOR_GIB BOOT_FAST_EXPERT_LOOKUP
+                    BOOT_FAST_MTP_FILES BOOT_FAST_PLE_FILES BOOT_FAST_SKIP_MM_WARMUP
+                    BOOT_FAST_MTP_ALLOW BOOT_HASH BOOT_HASH_DIR BOOT_TRACE BOOT_TRACE_DIR)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAP_$_v=\${$_v-}"
     eval "_SNAPSET_$_v=\${$_v+set}"
@@ -686,6 +690,49 @@ done
 ok "Patches ready."
 
 # ---------------------------------------------------------------------------
+# 4b. boot-fast: faster weight load, same weights (files/ours/*).
+#   BOOT_FAST=1 is the master switch. Each lever has its own knob, which
+#   defaults to BOOT_FAST. With every knob at 0, no file below is mounted.
+#   R3+R5  BOOT_FAST_WINDOW          bounded read-ahead window + PLE-only skip
+#   R2     BOOT_FAST_MTP_FILES       MTP drafter reads only its own files
+#   R6     BOOT_FAST_PLE_FILES       PLE offload worker reads only its own files
+#   R4     BOOT_FAST_EXPERT_LOOKUP   exact index for the expert mapping match
+#   R9     BOOT_FAST_SKIP_MM_WARMUP  skip the API multi-modal warmup (default 0)
+#   Verification only: BOOT_HASH=1 (weight hash manifests to BOOT_HASH_DIR),
+#   BOOT_TRACE=1 (loader trace to BOOT_TRACE_DIR).
+# ---------------------------------------------------------------------------
+BOOT_FAST="${BOOT_FAST:-0}"
+BOOT_FAST_WINDOW="${BOOT_FAST_WINDOW:-$BOOT_FAST}"
+BOOT_FAST_WINDOW_FILES="${BOOT_FAST_WINDOW_FILES:-1}"
+BOOT_FAST_WINDOW_METHOD="${BOOT_FAST_WINDOW_METHOD:-read}"
+BOOT_FAST_WINDOW_THREADS="${BOOT_FAST_WINDOW_THREADS:-1}"
+BOOT_FAST_WINDOW_FLOOR_GIB="${BOOT_FAST_WINDOW_FLOOR_GIB:-16}"
+BOOT_FAST_EXPERT_LOOKUP="${BOOT_FAST_EXPERT_LOOKUP:-$BOOT_FAST}"
+BOOT_FAST_MTP_FILES="${BOOT_FAST_MTP_FILES:-$BOOT_FAST}"
+BOOT_FAST_PLE_FILES="${BOOT_FAST_PLE_FILES:-$BOOT_FAST}"
+BOOT_FAST_SKIP_MM_WARMUP="${BOOT_FAST_SKIP_MM_WARMUP:-0}"
+BOOT_FAST_MTP_ALLOW="${BOOT_FAST_MTP_ALLOW:-}"
+BOOT_HASH="${BOOT_HASH:-0}"
+BOOT_HASH_DIR="${BOOT_HASH_DIR:-$SCRIPT_DIR/logs/boot-hash}"
+BOOT_TRACE="${BOOT_TRACE:-0}"
+BOOT_TRACE_DIR="${BOOT_TRACE_DIR:-$SCRIPT_DIR/logs/boot-trace}"
+BF_DOCKER_ARGS=""
+_bf_mount() {  # <host-file> <path-in-vllm-package>
+    BF_DOCKER_ARGS+=" -v $1:$VLLM_PKG/$2:ro"
+}
+if [[ "$BOOT_FAST_WINDOW$BOOT_FAST_MTP_FILES$BOOT_FAST_PLE_FILES$BOOT_FAST_EXPERT_LOOKUP$BOOT_FAST_SKIP_MM_WARMUP$BOOT_HASH$BOOT_TRACE" == *1* ]]; then
+    info "=== Step 4b: boot-fast ==="
+    OURS="$SCRIPT_DIR/files/ours"
+    _BF_GLOBS=$(python3 "$OURS/boot_fast_globs.py" "$MODEL_PATH/$SNAPSHOT_REL" \
+        --mtp-source "$PATCHED_MTP" 2>&1 >/dev/null | sed 's/^/  /'; true)
+    [[ -n "$_BF_GLOBS" ]] && echo "$_BF_GLOBS"
+    _BF_OUT=$(python3 "$OURS/boot_fast_globs.py" "$MODEL_PATH/$SNAPSHOT_REL" \
+        --mtp-source "$PATCHED_MTP" 2>/dev/null || true)
+    BF_MTP_GLOB=$(printf '%s\n' "$_BF_OUT" | sed -n 's/^MTP_GLOB=//p')
+    BF_PLE_GLOB=$(printf '%s\n' "$_BF_OUT" | sed -n 's/^PLE_GLOB=//p')
+fi
+
+# ---------------------------------------------------------------------------
 # Quant_algo dispatch pre-flight (review §5.6 / jschmied A2b). The runtime
 # reads the embedded quantization_config inside config.json, not the sidecar
 # hf_quant_config.json. If the checkpoint declares a quant_algo the image's
@@ -1089,6 +1136,7 @@ docker run \\
     -v $OFFLOAD_DIR/protocol.py:$VLLM_PKG/v1/ple_offload/protocol.py:ro \\
     -v $HF_CACHE_DIR:/root/.cache/huggingface \\
     -v $HOME/.cache/vllm:/root/.cache/vllm \\
+    $BF_DOCKER_ARGS \\
     $EXTRA_DOCKER_ARGS \\
     $IMAGE \\
     $MODEL_ID \\

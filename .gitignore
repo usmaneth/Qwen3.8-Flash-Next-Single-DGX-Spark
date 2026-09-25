@@ -134,3 +134,5 @@
 !/files/ours/patch_lm_head_fp8.py
 !/profiles/
 !/profiles/spark1-best.env
+!/files/ours/boot_fast_globs.py
+!/tests/test_boot_fast.py
