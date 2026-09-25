@@ -121,7 +121,11 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
                     MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE
                     KERN_DECODE KERN_RPC LM_HEAD_FP8_RESCORE SHORTCONV_ASYNC_H2D MTP_DENSE_W8A16 PLE_GPU_WAIT MTP_DENSE_W4A16 MTP_DRAFT_HEAD_W4 KERN_SKINNY MTP_FUSED_NORM QSA_FUSED_DRAFT
-                    KERN_L7 KERN_SKINNY_MX KERN_SKINNY_MX_FUSED KERN_SGATE KERN_L7_TILES KERN_L7_TILES_ON KERN_HOSTALLOC_MODE)
+                    KERN_L7 KERN_SKINNY_MX KERN_SKINNY_MX_FUSED KERN_SGATE KERN_L7_TILES KERN_L7_TILES_ON KERN_HOSTALLOC_MODE
+                    BOOT_FAST BOOT_FAST_WINDOW BOOT_FAST_WINDOW_FILES BOOT_FAST_WINDOW_METHOD
+                    BOOT_FAST_WINDOW_THREADS BOOT_FAST_WINDOW_FLOOR_GIB BOOT_FAST_WINDOW_MODE BOOT_FAST_BUFFER_PINNED BOOT_FAST_EXPERT_LOOKUP
+                    BOOT_FAST_MTP_FILES BOOT_FAST_PLE_FILES BOOT_FAST_SKIP_MM_WARMUP
+                    BOOT_FAST_MTP_ALLOW BOOT_FAST_PREFLIGHT_CACHE BOOT_FAST_EVICT BOOT_HASH BOOT_HASH_DIR BOOT_TRACE BOOT_TRACE_DIR)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAP_$_v=\${$_v-}"
     eval "_SNAPSET_$_v=\${$_v+set}"
@@ -806,6 +810,142 @@ done
 ok "Patches ready."
 
 # ---------------------------------------------------------------------------
+# 4b. boot-fast: faster weight load, same weights (files/ours/*).
+#   BOOT_FAST=1 is the master switch. Each lever has its own knob, which
+#   defaults to BOOT_FAST. With every knob at 0, no file below is mounted.
+#   R3+R5  BOOT_FAST_WINDOW          bounded read-ahead window + PLE-only skip
+#   R2     BOOT_FAST_MTP_FILES       MTP drafter reads only its own files
+#   R6     BOOT_FAST_PLE_FILES       PLE offload worker reads only its own files
+#   R4     BOOT_FAST_EXPERT_LOOKUP   exact index for the expert mapping match
+#   R9     BOOT_FAST_SKIP_MM_WARMUP  skip the API multi-modal warmup (default 0)
+#   Verification only: BOOT_HASH=1 (weight hash manifests to BOOT_HASH_DIR),
+#   BOOT_TRACE=1 (loader trace to BOOT_TRACE_DIR).
+# ---------------------------------------------------------------------------
+BOOT_FAST="${BOOT_FAST:-0}"
+BOOT_FAST_WINDOW="${BOOT_FAST_WINDOW:-$BOOT_FAST}"
+BOOT_FAST_WINDOW_FILES="${BOOT_FAST_WINDOW_FILES:-1}"
+BOOT_FAST_WINDOW_METHOD="${BOOT_FAST_WINDOW_METHOD:-read}"
+BOOT_FAST_WINDOW_THREADS="${BOOT_FAST_WINDOW_THREADS:-4}"  # M0c 2026-09-24: 1 thread 1.0 GB/s, 4 threads 2.7 GB/s per file
+BOOT_FAST_WINDOW_FLOOR_GIB="${BOOT_FAST_WINDOW_FLOOR_GIB:-16}"
+BOOT_FAST_WINDOW_MODE="${BOOT_FAST_WINDOW_MODE:-buffer}"  # buffer (R3b) or cache (R3); M0 2026-09-25: see the commit
+BOOT_FAST_BUFFER_PINNED="${BOOT_FAST_BUFFER_PINNED:-0}"   # R3b buffer in pinned host memory
+BOOT_FAST_EXPERT_LOOKUP="${BOOT_FAST_EXPERT_LOOKUP:-$BOOT_FAST}"
+BOOT_FAST_MTP_FILES="${BOOT_FAST_MTP_FILES:-$BOOT_FAST}"
+BOOT_FAST_PLE_FILES="${BOOT_FAST_PLE_FILES:-$BOOT_FAST}"
+BOOT_FAST_SKIP_MM_WARMUP="${BOOT_FAST_SKIP_MM_WARMUP:-0}"
+BOOT_FAST_MTP_ALLOW="${BOOT_FAST_MTP_ALLOW:-}"
+BOOT_HASH="${BOOT_HASH:-0}"
+BOOT_HASH_DIR="${BOOT_HASH_DIR:-$SCRIPT_DIR/logs/boot-hash}"
+BOOT_TRACE="${BOOT_TRACE:-0}"
+BOOT_TRACE_DIR="${BOOT_TRACE_DIR:-$SCRIPT_DIR/logs/boot-trace}"
+BF_DOCKER_ARGS=""
+_bf_mount() {  # <host-file> <path-in-vllm-package>
+    BF_DOCKER_ARGS+=" -v $1:$VLLM_PKG/$2:ro"
+}
+if [[ "$BOOT_FAST_WINDOW$BOOT_FAST_MTP_FILES$BOOT_FAST_PLE_FILES$BOOT_FAST_EXPERT_LOOKUP$BOOT_FAST_SKIP_MM_WARMUP$BOOT_HASH$BOOT_TRACE" == *1* ]]; then
+    info "=== Step 4b: boot-fast ==="
+    OURS="$SCRIPT_DIR/files/ours"
+    _BF_GLOBS=$(python3 "$OURS/boot_fast_globs.py" "$MODEL_PATH/$SNAPSHOT_REL" \
+        --mtp-source "$PATCHED_MTP" 2>&1 >/dev/null | sed 's/^/  /'; true)
+    [[ -n "$_BF_GLOBS" ]] && echo "$_BF_GLOBS"
+    _BF_OUT=$(python3 "$OURS/boot_fast_globs.py" "$MODEL_PATH/$SNAPSHOT_REL" \
+        --mtp-source "$PATCHED_MTP" 2>/dev/null || true)
+    BF_MTP_GLOB=$(printf '%s\n' "$_BF_OUT" | sed -n 's/^MTP_GLOB=//p')
+    BF_PLE_GLOB=$(printf '%s\n' "$_BF_OUT" | sed -n 's/^PLE_GLOB=//p')
+    # weight_utils.py carries the window, the trace and the R2/R6 index check
+    # (a file that a boot-fast glob leaves out is not "missing").
+    if [[ "$BOOT_FAST_WINDOW$BOOT_TRACE$BOOT_FAST_MTP_FILES$BOOT_FAST_PLE_FILES" == *1* ]]; then
+        extract "$VLLM_PKG/model_executor/model_loader/weight_utils.py" "$OURS/weight_utils.py.orig"
+        python3 "$OURS/patch_weight_utils_window.py" >/dev/null || err "patch_weight_utils_window.py failed"
+        _bf_mount "$OURS/weight_utils.py" model_executor/model_loader/weight_utils.py
+    fi
+    # R3b reads with O_DIRECT, so cached checkpoint pages give no gain. They
+    # can only hurt: L1 b5 (2026-09-25) had 74 GiB of checkpoint pages in the
+    # cache, the 74 GiB parameter allocation took MemFree to 0.9 GiB, and the
+    # PLE offload worker failed with a CUDA OOM. Drop only the checkpoint
+    # files from the page cache (POSIX_FADV_DONTNEED), not the global cache.
+    if [[ "$BOOT_FAST_WINDOW" == "1" && "$BOOT_FAST_WINDOW_MODE" == "buffer" && "${BOOT_FAST_EVICT:-1}" == "1" ]]; then
+        _BF_EVICT=$(python3 - "$MODEL_PATH/$SNAPSHOT_REL" <<'PYEOF' 2>&1
+import glob, os, sys
+n = b = 0
+for p in sorted(glob.glob(os.path.join(sys.argv[1], "*.safetensors"))):
+    try:
+        fd = os.open(p, os.O_RDONLY)
+    except OSError:
+        continue
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        n += 1
+        b += os.fstat(fd).st_size
+    finally:
+        os.close(fd)
+print(f"{n} files, {b / 2**30:.1f} GiB")
+PYEOF
+)
+        info "  R3b: checkpoint pages dropped from the page cache ($_BF_EVICT)"
+    fi
+    if [[ "$BOOT_FAST_WINDOW" == "1" ]]; then
+        # The window reads ahead every file that the iterator opens. Without
+        # the drafter filter it would read all 35 files again in pass 2.
+        if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 && ( "$BOOT_FAST_MTP_FILES" != "1" || -z "$BF_MTP_GLOB" ) ]]; then
+            err "BOOT_FAST_WINDOW=1 needs BOOT_FAST_MTP_FILES=1 and an MTP glob while MTP is on."
+        fi
+        BF_DOCKER_ARGS+=" -e VLLM_ST_WINDOW=$BOOT_FAST_WINDOW_FILES -e VLLM_ST_WINDOW_METHOD=$BOOT_FAST_WINDOW_METHOD"
+        BF_DOCKER_ARGS+=" -e VLLM_ST_WINDOW_THREADS=$BOOT_FAST_WINDOW_THREADS -e VLLM_ST_WINDOW_FLOOR_GIB=$BOOT_FAST_WINDOW_FLOOR_GIB"
+        BF_DOCKER_ARGS+=" -e VLLM_ST_DROP_DONE=1 -e VLLM_ST_SKIP_PLE_ONLY=1"
+        BF_DOCKER_ARGS+=" -e VLLM_ST_WINDOW_MODE=$BOOT_FAST_WINDOW_MODE -e VLLM_ST_BUFFER_PINNED=$BOOT_FAST_BUFFER_PINNED"
+        info "  R3+R5 window: mode $BOOT_FAST_WINDOW_MODE (pinned $BOOT_FAST_BUFFER_PINNED), $BOOT_FAST_WINDOW_FILES file(s) ahead, $BOOT_FAST_WINDOW_METHOD x$BOOT_FAST_WINDOW_THREADS, PLE-only files skipped"
+    fi
+    if [[ "$BOOT_FAST_MTP_FILES" == "1" || "$BOOT_HASH" == "1" ]]; then
+        python3 "$OURS/patch_mtp_file_filter.py" >/dev/null || err "patch_mtp_file_filter.py failed"
+    fi
+    if [[ "$BOOT_FAST_MTP_FILES" == "1" && "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
+        [[ -n "$BF_MTP_GLOB" ]] || err "BOOT_FAST_MTP_FILES=1 but the index gives no MTP glob."
+        BF_DOCKER_ARGS+=" -e 'VLLM_MTP_FILE_GLOB=$BF_MTP_GLOB'"
+        if [[ -n "$BOOT_FAST_MTP_ALLOW" ]]; then
+            [[ -r "$BOOT_FAST_MTP_ALLOW" ]] || err "BOOT_FAST_MTP_ALLOW=$BOOT_FAST_MTP_ALLOW is not readable"
+            BF_DOCKER_ARGS+=" -v $BOOT_FAST_MTP_ALLOW:/root/mtp_unloaded_allow.json:ro -e VLLM_MTP_UNLOADED_ALLOW=/root/mtp_unloaded_allow.json"
+        fi
+        info "  R2 drafter files: $BF_MTP_GLOB"
+    fi
+    if [[ "$BOOT_FAST_PLE_FILES" == "1" || "$BOOT_HASH" == "1" ]]; then
+        python3 "$OURS/patch_ple_offload_files.py" >/dev/null || err "patch_ple_offload_files.py failed"
+    fi
+    if [[ "$BOOT_FAST_PLE_FILES" == "1" ]]; then
+        [[ -n "$BF_PLE_GLOB" ]] || err "BOOT_FAST_PLE_FILES=1 but the index gives no PLE offload glob."
+        BF_DOCKER_ARGS+=" -e 'VLLM_PLE_OFFLOAD_FILE_GLOB=$BF_PLE_GLOB'"
+        info "  R6 offload files: $BF_PLE_GLOB"
+    fi
+    if [[ "$BOOT_FAST_EXPERT_LOOKUP" == "1" ]]; then
+        extract "$VLLM_PKG/model_executor/layers/fused_moe/routed_experts.py" "$OURS/routed_experts.py.orig"
+        python3 "$OURS/patch_routed_experts_lookup.py" >/dev/null || err "patch_routed_experts_lookup.py failed"
+        _bf_mount "$OURS/routed_experts.py" model_executor/layers/fused_moe/routed_experts.py
+        info "  R4 expert lookup: on"
+    fi
+    if [[ "$BOOT_FAST_SKIP_MM_WARMUP" == "1" ]]; then
+        extract "$VLLM_PKG/renderers/base.py" "$OURS/base.py.orig"
+        python3 "$OURS/patch_mm_warmup.py" >/dev/null || err "patch_mm_warmup.py failed"
+        _bf_mount "$OURS/base.py" renderers/base.py
+        BF_DOCKER_ARGS+=" -e VLLM_SKIP_MM_WARMUP=1"
+        info "  R9 multi-modal warmup: skipped"
+    fi
+    if [[ "$BOOT_HASH" == "1" ]]; then
+        extract "$VLLM_PKG/v1/worker/gpu/model_runner.py" "$OURS/model_runner.py.orig"
+        python3 "$OURS/patch_model_runner_hash.py" >/dev/null || err "patch_model_runner_hash.py failed"
+        _bf_mount "$OURS/model_runner.py" v1/worker/gpu/model_runner.py
+        _bf_mount "$OURS/boot_hash.py" boot_hash.py
+        mkdir -p "$BOOT_HASH_DIR"
+        BF_DOCKER_ARGS+=" -v $BOOT_HASH_DIR:/root/boot-hash -e VLLM_BOOT_HASH_DIR=/root/boot-hash -e VLLM_MTP_GUARD_RECORD=1"
+        info "  G1 weight hash: $BOOT_HASH_DIR"
+    fi
+    if [[ "$BOOT_TRACE" == "1" ]]; then
+        mkdir -p "$BOOT_TRACE_DIR"
+        BF_DOCKER_ARGS+=" -v $BOOT_TRACE_DIR:/root/boot-trace -e VLLM_ST_TRACE_DIR=/root/boot-trace"
+        info "  G2 loader trace: $BOOT_TRACE_DIR"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Quant_algo dispatch pre-flight (review §5.6 / jschmied A2b). The runtime
 # reads the embedded quantization_config inside config.json, not the sidecar
 # hf_quant_config.json. If the checkpoint declares a quant_algo the image's
@@ -852,8 +992,9 @@ print(" ".join(sorted(algos)))
 PY
 )
     if [[ -n "$_QALGO" ]]; then
-        _DISPATCH=$(docker run --rm --entrypoint python3 \
-            -v "$MODEL_PATH/$SNAPSHOT_REL:/m:ro" "$IMAGE" -c '
+        # The probe script. boot-fast R11 caches its output, keyed on the image
+        # (Id and RepoDigests), config.json, hf_quant_config.json and this text.
+        _QPROBE='
 import json, pathlib, sys
 cfg = json.loads(pathlib.Path("/m/config.json").read_text())
 qc = cfg.get("quantization_config")
@@ -878,7 +1019,41 @@ try:
 except Exception as e:
     print(json.dumps({"declared": declared, "error": str(e)[:200]}, default=str))
     sys.exit(3)
-' 2>/dev/null || echo "")
+'
+        # _last_json_line: print the last stdin line that is a JSON object, or fail.
+        _last_json_line() {
+            python3 -c 'import json,sys
+last = None
+for line in sys.stdin:
+    line = line.strip()
+    if line.startswith("{"):
+        try:
+            json.loads(line); last = line
+        except ValueError:
+            pass
+sys.exit(1) if last is None else print(last)'
+        }
+        _QCACHE=""
+        if [[ "${BOOT_FAST_PREFLIGHT_CACHE:-${BOOT_FAST:-0}}" == "1" ]]; then
+            _QKEY=$( { docker image inspect "$IMAGE" --format '{{.Id}} {{json .RepoDigests}}'
+                       cat "$MODEL_PATH/$SNAPSHOT_REL/config.json"
+                       cat "$MODEL_PATH/$SNAPSHOT_REL/hf_quant_config.json" 2>/dev/null || true
+                       printf '%s' "$_QPROBE"; } | sha256sum | cut -c1-32)
+            _QCACHE="$HOME/.cache/vllm/boot-fast/preflight-$_QKEY.json"
+        fi
+        if [[ -n "$_QCACHE" && -s "$_QCACHE" ]]; then
+            _DISPATCH=$(_last_json_line < "$_QCACHE" || echo "")
+            info "quant_algo pre-flight: cached result $(basename "$_QCACHE") (R11)"
+        else
+            # vLLM prints log lines to stdout on import, so keep only the last JSON line.
+            _DISPATCH=$(docker run --rm --entrypoint python3 \
+                -v "$MODEL_PATH/$SNAPSHOT_REL:/m:ro" "$IMAGE" -c "$_QPROBE" 2>/dev/null | _last_json_line || echo "")
+            # Only a clean result is cached: an error or an empty result runs the probe again next time.
+            if [[ -n "$_QCACHE" && -n "$_DISPATCH" && "$_DISPATCH" != *'"error"'* ]]; then
+                mkdir -p "$(dirname "$_QCACHE")"
+                printf '%s\n' "$_DISPATCH" > "$_QCACHE.tmp" && mv "$_QCACHE.tmp" "$_QCACHE"
+            fi
+        fi
         if [[ -z "$_DISPATCH" ]]; then
             warn "quant_algo pre-flight: image introspection failed (offline / older image); skipping."
             warn "     Checkpoint declares quant_algo: $_QALGO"
@@ -1213,6 +1388,7 @@ docker run \\
     -v $OFFLOAD_DIR/protocol.py:$VLLM_PKG/v1/ple_offload/protocol.py:ro \\
     -v $HF_CACHE_DIR:/root/.cache/huggingface \\
     -v $HOME/.cache/vllm:/root/.cache/vllm \\
+    $BF_DOCKER_ARGS \\
     $EXTRA_DOCKER_ARGS \\
     $IMAGE \\
     $MODEL_ID \\
@@ -1291,7 +1467,7 @@ LOGPID=$!
 WAIT_START=$(date +%s)
 _last_hb=0
 while true; do
-    sleep 10
+    sleep 1
     NOW=$(date +%s)
     ELAPSED=$((NOW - WAIT_START))
     if [[ "$ELAPSED" -gt "$READY_TIMEOUT_S" ]]; then

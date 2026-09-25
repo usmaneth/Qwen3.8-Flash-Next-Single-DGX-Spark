@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+"""Generate files/ours/weight_utils.py: a bounded read-ahead window for the lazy
+safetensors iterator (boot-fast R3), the PLE-only file skip (R5) and a loader
+trace (verification only).
+
+Why: the stock lazy iterator reads each tensor through mmap page faults in
+name order. A shard stores its data by dtype (F32, BF16, F8, U8), so the
+name order jumps between regions for each expert, and each fault reads
+128 KiB. The target pass reads about 72 GB at about 150 MB/s (430-440 s).
+
+The window does not change what the loader reads or in which order:
+  1. A daemon thread reads the next VLLM_ST_WINDOW files into the page cache,
+     in file order, with large sequential reads (or POSIX_FADV_WILLNEED).
+  2. The main thread waits until the thread has read file i. Then it runs the
+     stock statements on file i: safe_open, f.keys() in the stock order,
+     f.get_tensor(name). The yield order and the bytes do not change.
+  3. After file i closes, POSIX_FADV_DONTNEED drops it from the page cache
+     (VLLM_ST_DROP_DONE=1), except files that match VLLM_MTP_FILE_GLOB, which
+     the MTP drafter reads next.
+The reader thread never gives a tensor to the loader. If it fails, the loader
+reads through mmap as before.
+
+R5: with VLLM_ST_SKIP_PLE_ONLY=1, VLLM_PLE_CPU_OFFLOAD=1 and
+VLLM_PLE_PACKED_TABLE_DIR set, the GPU worker skips a file when every name in
+it is a packed PLE n-gram tensor. The target and the drafter drop these
+names (the offload worker serves them from the packed table).
+
+Knobs (container env). With every knob off, the stock statements run:
+  VLLM_ST_WINDOW=N              files ahead of the consumer (0 = off)
+  VLLM_ST_WINDOW_METHOD         read (default) or willneed
+  VLLM_ST_WINDOW_MODE           cache (default, R3) or buffer (R3b: O_DIRECT
+                                read of file i into one host buffer, and views
+                                of it in the stock name order)
+  VLLM_ST_BUFFER_PINNED=1       R3b buffer in pinned host memory
+  VLLM_ST_WINDOW_THREADS        reader threads for each file (default 1)
+  VLLM_ST_WINDOW_FLOOR_GIB      pause reads while MemAvailable is below (16)
+  VLLM_ST_DROP_DONE=1           drop a consumed file from the page cache
+  VLLM_ST_SKIP_PLE_ONLY=1       R5
+  VLLM_ST_TRACE_DIR=DIR         one line per yielded tensor, one file per pass
+
+R2/R6 index check: filter_duplicate_safetensors_files does not report an
+index file as missing when a boot-fast glob left it out on purpose and the
+file exists on disk (see _bf_intended_subset).
+
+The window and the skip run only in the GPU worker (not is_offload_process()).
+The trace runs in every process.
+
+    patch_weight_utils_window.py        (reads files/ours/weight_utils.py.orig)
+"""
+import hashlib
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ORIG = os.path.join(HERE, "weight_utils.py.orig")
+OUT = os.path.join(HERE, "weight_utils.py")
+# vllm/vllm-openai:qwen38-flash-next, RepoDigest sha256:fc120ece0a38...
+ORIG_MD5 = "3e69e899ffe0be8671de85cf84de5e82"
+
+ANCHOR_LOOP = '''    leftover_state_dict: dict[str, torch.Tensor] = {}
+    for st_file in tqdm(
+        sorted_files,
+'''
+NEW_LOOP = '''    leftover_state_dict: dict[str, torch.Tensor] = {}
+    _bf_win = _BootFastWindow.create(sorted_files, safetensors_load_strategy)
+    _bf_trace = _BootFastTrace.create()
+    for st_file in tqdm(
+        sorted_files,
+'''
+
+ANCHOR_LAZY = '''        else:
+            with safe_open(st_file, framework="pt") as f:
+                for name in f.keys():  # noqa: SIM118
+                    if should_skip_weight(name, local_expert_ids):
+                        continue
+                    param = f.get_tensor(name)
+                    yield name, param
+'''
+NEW_LAZY = '''        else:
+            if _bf_win is not None:
+                if _bf_win.skip(st_file):
+                    continue
+                _bf_win.wait(st_file)
+            if _bf_trace is not None:
+                _bf_trace.begin(st_file)
+            with safe_open(st_file, framework="pt") as f:
+                for name in f.keys():  # noqa: SIM118
+                    if should_skip_weight(name, local_expert_ids):
+                        continue
+                    if _bf_win is not None and _bf_win.buffer is not None:
+                        param = _bf_win.tensor(f, name)
+                    else:
+                        param = f.get_tensor(name)
+                    if _bf_trace is not None:
+                        _bf_trace.record(name, param)
+                    yield name, param
+            if _bf_trace is not None:
+                _bf_trace.end()
+            if _bf_win is not None:
+                _bf_win.done(st_file)
+'''
+
+ANCHOR_DEF = "\ndef safetensors_weights_iterator(\n"
+
+# R2/R6: the drafter and the offload worker narrow the file list with one glob
+# (allow_patterns_overrides). The stock index check then reports every other
+# index file as missing. With a boot-fast glob in force, a file that exists on
+# disk but is outside the glob is not missing; a file that is not on disk still
+# raises, as in stock.
+ANCHOR_MISSING = """    hf_weights_files_set = set(hf_weights_files)
+    missing_files = weight_files_in_index - hf_weights_files_set
+    if missing_files:
+"""
+NEW_MISSING = """    hf_weights_files_set = set(hf_weights_files)
+    missing_files = weight_files_in_index - hf_weights_files_set
+    missing_files = _bf_intended_subset(hf_weights_files, missing_files)
+    if missing_files:
+"""
+
+HELPERS = r'''
+
+# --- boot-fast: read-ahead window, PLE-only skip, loader trace -------------
+# Generated by files/ours/patch_weight_utils_window.py. See that file.
+_BF_PACKED_PLE = re.compile(
+    r"\.ple\.ple_embedding\.ngram_embedding\.shard_\d+\.(weight|weight_scale)$"
+)
+_BF_PASS = {"n": 0}
+
+
+def _bf_header(path: str) -> dict:
+    import struct
+
+    with open(path, "rb") as fh:
+        (n,) = struct.unpack("<Q", fh.read(8))
+        hdr = json.loads(fh.read(n))
+    hdr.pop("__metadata__", None)
+    hdr["__data_start__"] = 8 + n
+    return hdr
+
+
+def _bf_intended_subset(present, missing):
+    """The index files that are missing, less the files that a boot-fast glob
+    left out on purpose (R2 drafter, R6 offload worker). A file is left out on
+    purpose only when every present file matches one boot-fast glob and the
+    left-out file exists on disk."""
+    globs = [
+        g
+        for g in (
+            os.environ.get("VLLM_MTP_FILE_GLOB", ""),
+            os.environ.get("VLLM_PLE_OFFLOAD_FILE_GLOB", ""),
+        )
+        if g
+    ]
+    if not globs or not present or not missing:
+        return missing
+    for g in globs:
+        if all(fnmatch.fnmatchcase(os.path.basename(f), g) for f in present):
+            real = {f for f in missing if not os.path.isfile(f)}
+            logger.info(
+                "boot-fast: %d index files are outside the glob %s (on disk, "
+                "not read by this loader); %d index files are not on disk",
+                len(missing) - len(real),
+                g,
+                len(real),
+            )
+            return real
+    return missing
+
+
+def _bf_mem_available_gib() -> float:
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1048576.0
+    except OSError:
+        pass
+    return float("inf")
+
+
+class _BootFastWindow:
+    """Read the next N files into the page cache while file i is consumed."""
+
+    CHUNK = 16 << 20
+
+    @classmethod
+    def create(cls, files, strategy):
+        try:
+            n = int(os.environ.get("VLLM_ST_WINDOW", "0") or 0)
+        except ValueError:
+            n = 0
+        if n <= 0 or strategy not in (None, "lazy") or is_offload_process():
+            return None
+        return cls(list(files), n)
+
+    def __init__(self, files, n):
+        self.n = n
+        self.method = os.environ.get("VLLM_ST_WINDOW_METHOD", "read")
+        self.threads = max(1, int(os.environ.get("VLLM_ST_WINDOW_THREADS", "1") or 1))
+        self.floor = float(os.environ.get("VLLM_ST_WINDOW_FLOOR_GIB", "16") or 16)
+        self.drop = os.environ.get("VLLM_ST_DROP_DONE", "0") == "1"
+        # cache: read into the page cache ahead (R3). buffer: O_DIRECT read of
+        # file i into one host buffer, then views in the stock order (R3b).
+        self.mode = os.environ.get("VLLM_ST_WINDOW_MODE", "cache")
+        self.pinned = os.environ.get("VLLM_ST_BUFFER_PINNED", "0") == "1"
+        self.buffer = None
+        self.buf_hdr = {}
+        self.buf_start = 0
+        self.buf_alive = 0
+        self._last_buf = None
+        keep_glob = os.environ.get("VLLM_MTP_FILE_GLOB", "")
+        self.skipped = set()
+        if (
+            os.environ.get("VLLM_ST_SKIP_PLE_ONLY", "0") == "1"
+            and os.environ.get("VLLM_PLE_CPU_OFFLOAD", "0") == "1"
+            and os.environ.get("VLLM_PLE_PACKED_TABLE_DIR", "")
+        ):
+            for f in files:
+                names = [k for k in _bf_header(f) if k != "__data_start__"]
+                if names and all(_BF_PACKED_PLE.search(k) for k in names):
+                    self.skipped.add(f)
+                    logger.info(
+                        "boot-fast window: skip %s (%d packed PLE names, "
+                        "served by the offload worker)",
+                        os.path.basename(f),
+                        len(names),
+                    )
+        self.order = [f for f in files if f not in self.skipped]
+        self.keep = {
+            f
+            for f in self.order
+            if keep_glob and fnmatch.fnmatchcase(os.path.basename(f), keep_glob)
+        }
+        self.index = {f: i for i, f in enumerate(self.order)}
+        self.events = [threading.Event() for _ in self.order]
+        self.read_s = [0.0] * len(self.order)
+        self.cond = threading.Condition()
+        self.consumer = 0
+        self.closed = False
+        self.t_wait = {}
+        self.t_begin = {}
+        self.t_start = time.perf_counter()
+        self.tot_wait = 0.0
+        self.tot_bytes = 0
+        self.thread = threading.Thread(
+            target=self._run, name="bootfast-window", daemon=True
+        )
+        if self.mode == "buffer":
+            for ev in self.events:
+                ev.set()
+        logger.info(
+            "boot-fast window: %d files, %d skipped, window %d, method %s, "
+            "threads %d, floor %.1f GiB, drop %s, keep %s",
+            len(self.order),
+            len(self.skipped),
+            self.n,
+            self.method,
+            self.threads,
+            self.floor,
+            self.drop,
+            sorted(os.path.basename(f) for f in self.keep),
+        )
+        if self.mode != "buffer":
+            self.thread.start()
+
+    # buffer mode (R3b) -------------------------------------------------
+    _DTYPES = {
+        "F64": torch.float64, "F32": torch.float32, "F16": torch.float16,
+        "BF16": torch.bfloat16, "I64": torch.int64, "I32": torch.int32,
+        "I16": torch.int16, "I8": torch.int8, "U8": torch.uint8, "BOOL": torch.bool,
+        "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2,
+    }
+
+    def _read_buffer(self, path):
+        import ctypes
+
+        size = os.path.getsize(path)
+        alloc = -(-size // 4096) * 4096
+        raw = torch.empty(alloc + 4096, dtype=torch.uint8, pin_memory=self.pinned)
+        pad = (-raw.data_ptr()) % 4096
+        buf = raw[pad : pad + alloc]
+        base = buf.data_ptr()
+        threads = max(1, self.threads)
+        part = -(-alloc // threads)
+        part = -(-part // self.CHUNK) * self.CHUNK
+        errors = []
+
+        def work(start, end):
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+            except OSError:
+                fd = os.open(path, os.O_RDONLY)
+            try:
+                off = start
+                while off < end:
+                    n = min(self.CHUNK, end - off)
+                    mv = memoryview((ctypes.c_char * n).from_address(base + off)).cast("B")
+                    got = os.preadv(fd, [mv], off)
+                    if got <= 0:
+                        break
+                    off += got
+            except OSError as exc:
+                errors.append(exc)
+            finally:
+                os.close(fd)
+
+        ths = [
+            threading.Thread(target=work, args=(s0, min(s0 + part, alloc)), daemon=True)
+            for s0 in range(0, alloc, part)
+        ]
+        for t in ths:
+            t.start()
+        for t in ths:
+            t.join()
+        if errors:
+            raise errors[0]
+        return raw, buf, size
+
+    def tensor(self, f, name):
+        """A view of the buffer with the bytes of `name`; get_tensor if not possible."""
+        meta = self.buf_hdr.get(name)
+        dtype = self._DTYPES.get(meta["dtype"]) if meta else None
+        if dtype is None:
+            return f.get_tensor(name)
+        a, b = meta["data_offsets"]
+        raw = self.buffer[self.buf_start + a : self.buf_start + b]
+        try:
+            return raw.view(dtype).reshape(meta["shape"])
+        except RuntimeError:
+            return f.get_tensor(name)
+
+    # reader thread -----------------------------------------------------
+    def _read_range(self, path, start, end):
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            if self.method == "willneed":
+                off = start
+                step = 64 << 20
+                while off < end:
+                    os.posix_fadvise(fd, off, min(step, end - off), os.POSIX_FADV_WILLNEED)
+                    off += step
+            buf = bytearray(self.CHUNK)
+            mv = memoryview(buf)
+            off = start
+            while off < end:
+                n = os.preadv(fd, [mv[: min(self.CHUNK, end - off)]], off)
+                if n <= 0:
+                    break
+                off += n
+        finally:
+            os.close(fd)
+
+    def _read_file(self, path):
+        size = os.path.getsize(path)
+        if self.threads == 1:
+            self._read_range(path, 0, size)
+            return size
+        part = -(-size // self.threads)
+        part = -(-part // self.CHUNK) * self.CHUNK
+        ths = [
+            threading.Thread(
+                target=self._read_range,
+                args=(path, s, min(s + part, size)),
+                daemon=True,
+            )
+            for s in range(0, size, part)
+        ]
+        for t in ths:
+            t.start()
+        for t in ths:
+            t.join()
+        return size
+
+    def _run(self):
+        paused = False
+        try:
+            for i, path in enumerate(self.order):
+                with self.cond:
+                    while not self.closed and i > self.consumer + self.n:
+                        self.cond.wait(timeout=1.0)
+                    if self.closed:
+                        return
+                while _bf_mem_available_gib() < self.floor:
+                    if not paused:
+                        logger.info(
+                            "boot-fast window: pause, MemAvailable %.1f GiB < %.1f",
+                            _bf_mem_available_gib(),
+                            self.floor,
+                        )
+                        paused = True
+                    if self.closed:
+                        return
+                    time.sleep(0.5)
+                paused = False
+                t0 = time.perf_counter()
+                self.tot_bytes += self._read_file(path)
+                self.read_s[i] = time.perf_counter() - t0
+                self.events[i].set()
+        except Exception:
+            logger.exception("boot-fast window: reader failed; mmap reads continue")
+        finally:
+            for ev in self.events:
+                ev.set()
+
+    # consumer ----------------------------------------------------------
+    def skip(self, path):
+        return path in self.skipped
+
+    def wait(self, path):
+        i = self.index[path]
+        if self.mode == "buffer":
+            import weakref
+
+            t0 = time.perf_counter()
+            if self._last_buf is not None and self._last_buf() is not None:
+                self.buf_alive += 1
+            try:
+                raw, buf, size = self._read_buffer(path)
+                self.buf_hdr = _bf_header(path)
+                self.buf_start = self.buf_hdr["__data_start__"]
+                self.buffer = buf
+                self._last_buf = weakref.ref(raw)
+                self.tot_bytes += size
+            except Exception:
+                logger.exception("boot-fast window: buffer read of %s failed; get_tensor", path)
+                self.buffer = None
+            self.read_s[i] = time.perf_counter() - t0
+            self.t_wait[i] = self.read_s[i]
+            self.t_begin[i] = time.perf_counter()
+            self.tot_wait += self.read_s[i]
+            return
+        with self.cond:
+            self.consumer = i
+            self.cond.notify_all()
+        t0 = time.perf_counter()
+        self.events[i].wait()
+        now = time.perf_counter()
+        self.t_wait[i] = now - t0
+        self.t_begin[i] = now
+        self.tot_wait += now - t0
+
+    def done(self, path):
+        i = self.index[path]
+        consume = time.perf_counter() - self.t_begin.get(i, time.perf_counter())
+        self.buffer = None
+        self.buf_hdr = {}
+        dropped = False
+        if self.drop and path not in self.keep:
+            try:
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                    dropped = True
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
+        logger.info(
+            "boot-fast window: %s %.2f GiB read %.1fs wait %.1fs consume %.1fs%s "
+            "avail %.1f GiB",
+            os.path.basename(path),
+            os.path.getsize(path) / 2**30,
+            self.read_s[i],
+            self.t_wait.get(i, 0.0),
+            consume,
+            " dropped" if dropped else "",
+            _bf_mem_available_gib(),
+        )
+        with self.cond:
+            self.consumer = i + 1
+            self.cond.notify_all()
+        if i == len(self.order) - 1:
+            self.closed = True
+            total = time.perf_counter() - self.t_start
+            logger.info(
+                "boot-fast window: done, %d files, %.2f GiB read in %.1fs, "
+                "consumer waited %.1fs (mode %s, buffers still referenced %d)",
+                len(self.order),
+                self.tot_bytes / 2**30,
+                total,
+                self.tot_wait,
+                self.mode,
+                self.buf_alive,
+            )
+
+
+class _BootFastTrace:
+    """One line per yielded tensor: file, name, dtype, shape, data offsets."""
+
+    @classmethod
+    def create(cls):
+        d = os.environ.get("VLLM_ST_TRACE_DIR", "")
+        if not d:
+            return None
+        return cls(d)
+
+    def __init__(self, d):
+        os.makedirs(d, exist_ok=True)
+        role = "offload" if is_offload_process() else "gpu"
+        n = _BF_PASS["n"]
+        _BF_PASS["n"] += 1
+        self.path = os.path.join(d, f"trace-{role}-{os.getpid()}-{n}.tsv")
+        self.fh = open(self.path, "w", buffering=1 << 20)
+        self.file = ""
+        self.hdr = {}
+
+    def begin(self, st_file):
+        self.fh.flush()
+        self.file = os.path.basename(st_file)
+        self.hdr = _bf_header(st_file)
+
+    def record(self, name, tensor):
+        meta = self.hdr.get(name, {})
+        off = meta.get("data_offsets", ("", ""))
+        self.fh.write(
+            f"{self.file}\t{name}\t{meta.get('dtype', '')}\t"
+            f"{'x'.join(str(s) for s in tensor.shape)}\t{off[0]}\t{off[1]}\n"
+        )
+
+    def end(self):
+        self.fh.flush()
+
+
+# --- end boot-fast ----------------------------------------------------------
+'''
+
+
+def main():
+    with open(ORIG, "rb") as fh:
+        raw = fh.read()
+    md5 = hashlib.md5(raw).hexdigest()
+    if md5 != ORIG_MD5:
+        sys.exit(f"weight_utils.py.orig md5 {md5} != {ORIG_MD5}: image changed, re-check the patch")
+    s = raw.decode()
+    for name, anchor in (("loop", ANCHOR_LOOP), ("lazy", ANCHOR_LAZY), ("def", ANCHOR_DEF),
+                         ("missing", ANCHOR_MISSING)):
+        if s.count(anchor) != 1:
+            sys.exit(f"anchor '{name}' found {s.count(anchor)} times (want 1)")
+    s = s.replace(ANCHOR_LOOP, NEW_LOOP, 1)
+    s = s.replace(ANCHOR_LAZY, NEW_LAZY, 1)
+    s = s.replace(ANCHOR_MISSING, NEW_MISSING, 1)
+    s = s.replace(ANCHOR_DEF, HELPERS + ANCHOR_DEF, 1)
+    with open(OUT, "w") as fh:
+        fh.write(s)
+    print(f"wrote {OUT}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,10 @@
+[
+"model.layers.0.mlp.experts.routed_experts.w13_input_scale",
+"model.layers.0.mlp.experts.routed_experts.w13_weight",
+"model.layers.0.mlp.experts.routed_experts.w13_weight_scale",
+"model.layers.0.mlp.experts.routed_experts.w13_weight_scale_2",
+"model.layers.0.mlp.experts.routed_experts.w2_input_scale",
+"model.layers.0.mlp.experts.routed_experts.w2_weight",
+"model.layers.0.mlp.experts.routed_experts.w2_weight_scale",
+"model.layers.0.mlp.experts.routed_experts.w2_weight_scale_2"
+]

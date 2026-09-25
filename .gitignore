@@ -173,3 +173,13 @@
 !/tools/l7/lease_l7_inlaunch.sh
 !/tools/l7/lease_l7_any.sh
 !/tools/l7/sync_l7_spark2.sh
+!/files/ours/boot_fast_globs.py
+!/tests/test_boot_fast.py
+!/files/ours/patch_weight_utils_window.py
+!/files/ours/patch_mtp_file_filter.py
+!/files/ours/patch_ple_offload_files.py
+!/files/ours/patch_routed_experts_lookup.py
+!/files/ours/boot_hash.py
+!/files/ours/patch_model_runner_hash.py
+!/files/ours/patch_mm_warmup.py
+!/files/ours/mtp_unloaded_allow.json
