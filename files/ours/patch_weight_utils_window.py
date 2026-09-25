@@ -38,6 +38,10 @@ Knobs (container env). With every knob off, the stock statements run:
   VLLM_ST_SKIP_PLE_ONLY=1       R5
   VLLM_ST_TRACE_DIR=DIR         one line per yielded tensor, one file per pass
 
+R2/R6 index check: filter_duplicate_safetensors_files does not report an
+index file as missing when a boot-fast glob left it out on purpose and the
+file exists on disk (see _bf_intended_subset).
+
 The window and the skip run only in the GPU worker (not is_offload_process()).
 The trace runs in every process.
 
@@ -98,6 +102,21 @@ NEW_LAZY = '''        else:
 
 ANCHOR_DEF = "\ndef safetensors_weights_iterator(\n"
 
+# R2/R6: the drafter and the offload worker narrow the file list with one glob
+# (allow_patterns_overrides). The stock index check then reports every other
+# index file as missing. With a boot-fast glob in force, a file that exists on
+# disk but is outside the glob is not missing; a file that is not on disk still
+# raises, as in stock.
+ANCHOR_MISSING = """    hf_weights_files_set = set(hf_weights_files)
+    missing_files = weight_files_in_index - hf_weights_files_set
+    if missing_files:
+"""
+NEW_MISSING = """    hf_weights_files_set = set(hf_weights_files)
+    missing_files = weight_files_in_index - hf_weights_files_set
+    missing_files = _bf_intended_subset(hf_weights_files, missing_files)
+    if missing_files:
+"""
+
 HELPERS = r'''
 
 # --- boot-fast: read-ahead window, PLE-only skip, loader trace -------------
@@ -117,6 +136,35 @@ def _bf_header(path: str) -> dict:
     hdr.pop("__metadata__", None)
     hdr["__data_start__"] = 8 + n
     return hdr
+
+
+def _bf_intended_subset(present, missing):
+    """The index files that are missing, less the files that a boot-fast glob
+    left out on purpose (R2 drafter, R6 offload worker). A file is left out on
+    purpose only when every present file matches one boot-fast glob and the
+    left-out file exists on disk."""
+    globs = [
+        g
+        for g in (
+            os.environ.get("VLLM_MTP_FILE_GLOB", ""),
+            os.environ.get("VLLM_PLE_OFFLOAD_FILE_GLOB", ""),
+        )
+        if g
+    ]
+    if not globs or not present or not missing:
+        return missing
+    for g in globs:
+        if all(fnmatch.fnmatchcase(os.path.basename(f), g) for f in present):
+            real = {f for f in missing if not os.path.isfile(f)}
+            logger.info(
+                "boot-fast: %d index files are outside the glob %s (on disk, "
+                "not read by this loader); %d index files are not on disk",
+                len(missing) - len(real),
+                g,
+                len(real),
+            )
+            return real
+    return missing
 
 
 def _bf_mem_available_gib() -> float:
@@ -484,11 +532,13 @@ def main():
     if md5 != ORIG_MD5:
         sys.exit(f"weight_utils.py.orig md5 {md5} != {ORIG_MD5}: image changed, re-check the patch")
     s = raw.decode()
-    for name, anchor in (("loop", ANCHOR_LOOP), ("lazy", ANCHOR_LAZY), ("def", ANCHOR_DEF)):
+    for name, anchor in (("loop", ANCHOR_LOOP), ("lazy", ANCHOR_LAZY), ("def", ANCHOR_DEF),
+                         ("missing", ANCHOR_MISSING)):
         if s.count(anchor) != 1:
             sys.exit(f"anchor '{name}' found {s.count(anchor)} times (want 1)")
     s = s.replace(ANCHOR_LOOP, NEW_LOOP, 1)
     s = s.replace(ANCHOR_LAZY, NEW_LAZY, 1)
+    s = s.replace(ANCHOR_MISSING, NEW_MISSING, 1)
     s = s.replace(ANCHOR_DEF, HELPERS + ANCHOR_DEF, 1)
     with open(OUT, "w") as fh:
         fh.write(s)

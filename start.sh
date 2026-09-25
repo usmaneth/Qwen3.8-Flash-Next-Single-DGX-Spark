@@ -732,7 +732,9 @@ if [[ "$BOOT_FAST_WINDOW$BOOT_FAST_MTP_FILES$BOOT_FAST_PLE_FILES$BOOT_FAST_EXPER
         --mtp-source "$PATCHED_MTP" 2>/dev/null || true)
     BF_MTP_GLOB=$(printf '%s\n' "$_BF_OUT" | sed -n 's/^MTP_GLOB=//p')
     BF_PLE_GLOB=$(printf '%s\n' "$_BF_OUT" | sed -n 's/^PLE_GLOB=//p')
-    if [[ "$BOOT_FAST_WINDOW" == "1" || "$BOOT_TRACE" == "1" ]]; then
+    # weight_utils.py carries the window, the trace and the R2/R6 index check
+    # (a file that a boot-fast glob leaves out is not "missing").
+    if [[ "$BOOT_FAST_WINDOW$BOOT_TRACE$BOOT_FAST_MTP_FILES$BOOT_FAST_PLE_FILES" == *1* ]]; then
         extract "$VLLM_PKG/model_executor/model_loader/weight_utils.py" "$OURS/weight_utils.py.orig"
         python3 "$OURS/patch_weight_utils_window.py" >/dev/null || err "patch_weight_utils_window.py failed"
         _bf_mount "$OURS/weight_utils.py" model_executor/model_loader/weight_utils.py

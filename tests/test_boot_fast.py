@@ -10,6 +10,9 @@
       the stock `weight_name in qual_name` scan, for every expert name of the
       index and for edge names.
   T6  The offload, drafter and PLE-only file sets from the real index.
+  T7  The index check (filter_duplicate_safetensors_files) accepts a file
+      list that a boot-fast glob narrowed on purpose, and still raises for a
+      file that is not on disk, a list outside the glob, or no glob (stock).
 
 T2 and T6 run on the host. T1 and T4 need torch, safetensors and vLLM, so
 they run in the image (no GPU):
@@ -130,6 +133,94 @@ class GlobTests(unittest.TestCase):
         on_disk = os.listdir(SNAP)
         globs.check_glob(g, mtp, on_disk)
         globs.check_glob(gp, ple, on_disk)
+
+
+# ------------------------------------------------------------------------- T7
+@unittest.skipUnless(HAVE_VLLM, "needs the image (torch, safetensors, vllm)")
+class IndexCheckTests(unittest.TestCase):
+    ENV = ("VLLM_MTP_FILE_GLOB", "VLLM_PLE_OFFLOAD_FILE_GLOB")
+
+    @classmethod
+    def setUpClass(cls):
+        import vllm.model_executor.model_loader.weight_utils as orig
+        cls.orig = orig
+        cls.patched = load_file_module("bf_weight_utils_t7", OURS / "weight_utils.py")
+        cls.tmp = tempfile.TemporaryDirectory()
+        d = cls.tmp.name
+        cls.names = [f"model-{i:05d}-of-00004.safetensors" for i in range(1, 5)]
+        for n in cls.names:
+            Path(d, n).write_bytes(b"x")
+        wm = {f"w{i}": n for i, n in enumerate(cls.names)}
+        Path(d, "model.safetensors.index.json").write_text(json.dumps({"weight_map": wm}))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def setUp(self):
+        self.saved = {k: os.environ.pop(k, None) for k in self.ENV}
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+    def run_check(self, mod, present):
+        d = self.tmp.name
+        return mod.filter_duplicate_safetensors_files(
+            [os.path.join(d, n) for n in present], d, "model.safetensors.index.json")
+
+    def test_full_list_same_as_stock(self):
+        os.environ["VLLM_MTP_FILE_GLOB"] = "model-0000[34]-of-00004.safetensors"
+        self.assertEqual(self.run_check(self.patched, self.names), self.run_check(self.orig, self.names))
+
+    def test_no_glob_raises_as_stock(self):
+        for mod in (self.orig, self.patched):
+            with self.assertRaises(FileNotFoundError):
+                self.run_check(mod, self.names[2:])
+
+    def test_glob_subset(self):
+        for key in self.ENV:
+            os.environ[key] = "model-0000[34]-of-00004.safetensors"
+            got = self.run_check(self.patched, self.names[2:])
+            self.assertEqual([os.path.basename(f) for f in got], self.names[2:])
+            os.environ.pop(key)
+
+    def test_list_outside_glob_raises(self):
+        os.environ["VLLM_MTP_FILE_GLOB"] = "model-0000[4]-of-00004.safetensors"
+        with self.assertRaises(FileNotFoundError):
+            self.run_check(self.patched, self.names[2:])
+
+    def test_file_not_on_disk_raises(self):
+        d = tempfile.mkdtemp(dir=self.tmp.name)
+        for n in self.names[2:]:
+            Path(d, n).write_bytes(b"x")
+        wm = {f"w{i}": n for i, n in enumerate(self.names)}
+        Path(d, "model.safetensors.index.json").write_text(json.dumps({"weight_map": wm}))
+        os.environ["VLLM_MTP_FILE_GLOB"] = "model-0000[34]-of-00004.safetensors"
+        with self.assertRaises(FileNotFoundError):
+            self.patched.filter_duplicate_safetensors_files(
+                [os.path.join(d, n) for n in self.names[2:]], d, "model.safetensors.index.json")
+
+    @unittest.skipUnless(HAVE_INDEX and os.path.isfile(MTP_SOURCE), "no index or mtp source")
+    def test_real_index(self):
+        wm = globs.load_weight_map(SNAP)
+        for key, need in (("VLLM_MTP_FILE_GLOB", globs.mtp_files(wm, globs.load_remap(MTP_SOURCE))),
+                          ("VLLM_PLE_OFFLOAD_FILE_GLOB", globs.ple_offload_files(wm))):
+            g = globs.make_glob(need)
+            present = sorted(os.path.join(SNAP, f) for f in os.listdir(SNAP)
+                             if fnmatch.fnmatchcase(f, g))
+            os.environ[key] = g
+            got = self.patched.filter_duplicate_safetensors_files(
+                present, SNAP, "model.safetensors.index.json")
+            os.environ.pop(key)
+            # The loader reads every index file that the glob matches (a superset of need).
+            want = sorted(f for f in set(wm.values()) if fnmatch.fnmatchcase(f, g))
+            self.assertTrue(set(need) <= set(want), key)
+            self.assertEqual([os.path.basename(f) for f in got], want, key)
+            with self.assertRaises(FileNotFoundError):
+                self.orig.filter_duplicate_safetensors_files(present, SNAP, "model.safetensors.index.json")
 
 
 # ------------------------------------------------------------------------- T1
@@ -378,7 +469,8 @@ class PatchStructureTests(unittest.TestCase):
     new _bf_ helpers have no decorator.
     """
     CHANGED = {
-        "weight_utils.py": {"safetensors_weights_iterator": None},
+        "weight_utils.py": {"safetensors_weights_iterator": None,
+                            "filter_duplicate_safetensors_files": None},
         "routed_experts.py": {"RoutedExperts": {"load_weights"}},
         "model_runner.py": {"GPUModelRunner": {"load_model"}},
         "base.py": {"BaseRenderer": {"warmup"}},
