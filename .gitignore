@@ -148,4 +148,5 @@
 !/files/kern/patch_mtp_kern.py
 !/files/kern/patch_ple_kern.py
 !/files/kern/ple_gpu_wait.py
+!/files/kern/w4a16.py
 !/tests/test_kern_ext.py

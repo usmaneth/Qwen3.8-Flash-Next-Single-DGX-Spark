@@ -139,7 +139,7 @@ JOBS = [
     ("nvidia_model.py", "nvidia_model.py", patch_model),
     ("short_conv_attn.py", "short_conv_attn.py", patch_short_conv),
 ]
-COPIES = ["lm_head_fp8.py", "kd_ext.py", "mtp_w8a16.py", "ple_gpu_wait.py"]
+COPIES = ["lm_head_fp8.py", "kd_ext.py", "mtp_w8a16.py", "ple_gpu_wait.py", "w4a16.py"]
 
 
 def main() -> int:

@@ -285,3 +285,26 @@ def test_w8a16_method_falls_back():
     assert meth.apply(layer, torch.zeros(40, 32, dtype=torch.bfloat16)) == "bf16"  # M > MAX_M
     m._ON = False
     assert meth.apply(layer, torch.zeros(1, 32, dtype=torch.bfloat16)) == "bf16"  # knob off
+
+
+def test_w4_quantize_roundtrip_and_exact_bf16_weights():
+    m = _load("w4a16_test", os.path.join(KERN, "w4a16.py"))
+    torch.manual_seed(1)
+    w = (torch.randn(48, 256) * 0.03).to(torch.bfloat16)
+    w[3, :32] = 0  # an all-zero group
+    packed, gs, rs = m.quantize_w4(w, chunk_rows=20)
+    assert packed.shape == (48, 128) and gs.shape == (48, 8) and rs.shape == (48,)
+    deq = m.dequant_w4(packed, gs, rs).view(48, 256)
+    err = (deq - w.float()).abs()
+    step = (rs[:, None] * gs.float()).repeat_interleave(32, dim=1)
+    assert bool((err <= 0.5 * step * 1.001 + 1e-12).all())  # round-to-nearest
+    # q x gs is exact in BF16 (the kernel feeds it to tl.dot as BF16)
+    lo = (packed & 0xF).to(torch.int16) - 8
+    hi = (packed >> 4).to(torch.int16) - 8
+    q = torch.stack((lo, hi), -1).view(48, 256).float()
+    wq = (q.view(48, 8, 32) * gs.float()[..., None]).view(48, 256)
+    assert torch.equal(wq.to(torch.bfloat16).float(), wq)
+    x = torch.randn(2, 256).to(torch.bfloat16)
+    ref = m.w4a16_reference(x, packed, gs, rs)
+    alt = ((x.float() @ deq.t())).to(torch.bfloat16)
+    assert (ref.float() - alt.float()).abs().max() <= 0.02 * alt.float().abs().max()
