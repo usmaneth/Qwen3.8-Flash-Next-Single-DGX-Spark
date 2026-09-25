@@ -969,6 +969,14 @@ print(f"{int(bs)} {cr}")
     if [[ -n "${PREFILL_BLOCKS:-}" ]]; then
         [[ "$PREFILL_BLOCKS" =~ ^[1-9][0-9]*$ ]] || err "PREFILL_BLOCKS must be a positive integer (got: '$PREFILL_BLOCKS')"
         [[ "$_MTP_INTRO_SRC" == "formula" ]] || err "PREFILL_BLOCKS needs the files/mtp_block.py block (source: $_MTP_INTRO_SRC)"
+        # The budget is correct only with the Mamba-grid split. Stop if the
+        # scheduler.py that EXTRA_DOCKER_ARGS mounts does not have it (a stale
+        # files/ours/scheduler.py keeps the poisoned 12-token grid).
+        _PT_SCHED=$(grep -o -- '-v [^ ]*:[^ ]*/v1/core/sched/scheduler\.py' <<<"${EXTRA_DOCKER_ARGS:-}" | head -1)
+        _PT_SCHED=${_PT_SCHED#-v }; _PT_SCHED=${_PT_SCHED%%:*}
+        [[ -n "$_PT_SCHED" ]] || err "PREFILL_BLOCKS needs files/ours/scheduler.py mounted over v1/core/sched/scheduler.py in EXTRA_DOCKER_ARGS"
+        grep -q "prefill-ttft B1: align split grid" "$_PT_SCHED" 2>/dev/null \
+            || err "$_PT_SCHED has no Mamba-grid split: run files/ours/patch_block_drop.py, then files/ours/patch_mamba_grid.py"
         MAX_NUM_BATCHED_TOKENS=$(( PREFILL_BLOCKS * _MTP_BLOCK ))
         for _i in "${!VLLM_ARGS[@]}"; do
             [[ "${VLLM_ARGS[$_i]}" == "--max-num-batched-tokens" ]] && VLLM_ARGS[_i + 1]=$MAX_NUM_BATCHED_TOKENS
