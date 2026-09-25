@@ -19,10 +19,20 @@ layer index 1. With ``defer=1``:
    placeholder. ``install()`` wraps ``run_fullgraph`` and ``run_pw_graph``
    so that each one calls ``wait_pending()`` first. Decode (FULL graphs)
    therefore waits at the same point as the shipped path.
-4. Backstops: ``before_launch()`` and ``after_forward()`` (release_outputs)
+4. Replay guard: ``install()`` also wraps ``torch.cuda.CUDAGraph.replay``.
+   Each CUDA graph replay in the process goes through it, so a replay path
+   that a later vLLM adds (a new manager or a subclass that overrides
+   ``run_fullgraph``) also waits before its kernels go on the stream. When
+   the guard finds a pending record, it waits, counts it (``GUARD``) and
+   writes one note. The result stays exact; only the overlap is less.
+   Without the guard, ``install()`` does not allow the defer.
+5. Backstops: ``before_launch()`` and ``after_forward()`` (release_outputs)
    find a ``pending`` record that no wait took. That forward used the
-   buffer without a wait. With ``check=1`` this is an error. Else the
-   backstop waits, counts it and writes a "backstop" record.
+   buffer without a wait (an eager path without the placeholder). The
+   backstop waits, counts it and writes a "backstop" record. Then it sets
+   the defer off for the life of the process (``ALLOWED = False``), so at
+   most one forward can use the buffer without the wait. With ``check=1``
+   the backstop is also an error. The note goes to stderr each time.
 
 Order: the worker calls copy_stream.synchronize() before it writes the flag.
 The host enqueues the first kernel that reads the buffer only after it sees
@@ -39,7 +49,8 @@ from vllm.v1.ple_offload import ple_io as _ple_io
 
 pending = None  # (conn, seq, num_tokens, num_reqs, t0, t_sent) or None
 BACKSTOP = 0
-ALLOWED = False  # install() sets it when both replay methods are wrapped
+GUARD = 0  # replays that the torch-level guard had to wait for
+ALLOWED = False  # install() sets it when the replay methods and the guard are wrapped
 _wrapped: list[str] = []
 _BACKSTOP_HDR = "t_ns where seq count"
 
@@ -65,7 +76,7 @@ def wait_pending() -> None:
 
 
 def _backstop(where: str) -> None:
-    global BACKSTOP
+    global BACKSTOP, ALLOWED
     BACKSTOP += 1
     seq = pending[1] if pending is not None else -1
     msg = (f"PLE defer: a forward ran without the deferred wait (at {where}, "
@@ -73,10 +84,10 @@ def _backstop(where: str) -> None:
     if _ple_io.TRACE_DIR:
         _ple_io.trace("backstop", _BACKSTOP_HDR).add(_ple_io.now(), where, seq, BACKSTOP)
     wait_pending()
+    ALLOWED = False  # fail safe: no more deferred waits in this process
+    _ple_io.note("defer-backstop", msg + "; the defer is now off")
     if _ple_io.CHECK:
         raise RuntimeError(msg)
-    if BACKSTOP == 1:
-        _ple_io.note("defer-backstop", msg)
 
 
 def before_launch(conn) -> None:
@@ -89,6 +100,42 @@ def after_forward(conn) -> None:
     """In release_outputs (after the forward): the backstop."""
     if pending is not None:
         _backstop("release_outputs")
+
+
+def _guard_wait() -> None:
+    """The replay guard found a pending record: wait before the replay."""
+    global GUARD
+    GUARD += 1
+    seq = pending[1] if pending is not None else -1
+    wait_pending()
+    if GUARD == 1:
+        _ple_io.note("defer-guard", f"a CUDA graph replay outside the wrapped "
+                     f"methods found the pending wait (seq {seq}); it waited")
+
+
+def _graph_class():
+    """The CUDA graph class that vLLM replays (a test replaces this)."""
+    import torch
+    return torch.cuda.CUDAGraph
+
+
+def _wrap_guard(cls) -> bool:
+    fn = cls.__dict__.get("replay")
+    if fn is None:
+        return False
+    if getattr(fn, "_ple_io_defer", False):
+        return True
+
+    @functools.wraps(fn)
+    def replay(self, *args, **kwargs):
+        if pending is not None:
+            _guard_wait()
+        return fn(self, *args, **kwargs)
+
+    replay._ple_io_defer = True
+    setattr(cls, "replay", replay)
+    _wrapped.append(f"{cls.__name__}.replay")
+    return True
 
 
 def _wrap(cls, name: str) -> bool:
@@ -114,7 +161,8 @@ def install(conn) -> None:
     """Wrap the graph replay methods and the dummy-output path of ``conn``.
 
     Defer is allowed only when both replay methods of the MRV2 cudagraph
-    manager are wrapped and the connector stages CUDA inputs (MRV2).
+    manager and the torch replay guard are wrapped, and the connector
+    stages CUDA inputs (MRV2).
     """
     global ALLOWED
     ok = False
@@ -125,6 +173,9 @@ def install(conn) -> None:
         mcg = getattr(cgu, "ModelCudaGraphManager", None)
         if mcg is not None and "run_fullgraph" in mcg.__dict__:
             ok = _wrap(mcg, "run_fullgraph") and ok
+        if not _wrap_guard(_graph_class()):
+            _ple_io.note("defer", "no replay() on the CUDA graph class: no guard")
+            ok = False
     except Exception as exc:  # the defer stays off
         _ple_io.note("defer", f"install failed: {exc}")
         ok = False

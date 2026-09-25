@@ -10,9 +10,13 @@ stand-in connector, then checks the order of the waits:
   - defer=1: launch() returns without the wait. The replay wrappers
     (run_fullgraph, run_pw_graph), the eager placeholder path and
     signal_dummy_outputs wait before they run.
+  - The replay guard on the CUDA graph class waits before a replay that
+    does not go through a wrapped method, and counts it.
   - The backstops in before_launch() and after_forward() count a skipped
-    wait. With check=1 a skipped wait is an error.
-  - install() allows the defer only for a connector with CUDA inputs.
+    wait and set the defer off for the process. With check=1 a skipped
+    wait is an error.
+  - install() allows the defer only for a connector with CUDA inputs, and
+    only when the replay guard is in place.
 It also applies the hooks to the generated files when they exist
 (files/ple_offload/*.py) and compiles the result.
 """
@@ -63,6 +67,12 @@ def main() -> int:
     cgu.ModelCudaGraphManager = ModelCudaGraphManager
     sys.modules[cgu.__name__] = cgu
     d = load("vllm.v1.ple_offload.ple_io_defer", os.path.join(HERE, "ple_io_defer.py"))
+
+    class StubGraph:  # stands in for torch.cuda.CUDAGraph
+        def replay(self):
+            log.append("graph-replay")
+
+    d._graph_class = lambda: StubGraph
 
     class Conn:
         device = types.SimpleNamespace(type="cpu")
@@ -124,16 +134,40 @@ def main() -> int:
     conn.signal_dummy_outputs(7)
     expect("defer=1 dummy", ["wait5", "dummy"])
 
+    # A replay that no wrapped method covers (a new vLLM path): the guard
+    # waits before the graph runs. Inside a wrapped method it does nothing.
+    d.launch(conn, 50, 7, 1, 0, 0)
+    StubGraph().replay()
+    d.after_forward(conn)
+    expect("guard", ["wait50", "graph-replay"])
+    if d.GUARD != 1 or d.BACKSTOP != 0 or not d.ALLOWED:
+        fails += 1
+        print(f"FAIL guard count {d.GUARD} backstop {d.BACKSTOP} allowed {d.ALLOWED}")
+    d.launch(conn, 51, 7, 1, 0, 0)
+    CudaGraphManager().run_fullgraph(None)
+    StubGraph().replay()
+    expect("guard in a wrapped method", ["wait51", "replay-full", "graph-replay"])
+    if d.GUARD != 1:
+        fails += 1
+        print(f"FAIL guard count {d.GUARD} != 1")
+
     d.launch(conn, 6, 7, 1, 0, 0)
     d.after_forward(conn)  # the forward took no wait
     expect("backstop release", ["wait6"])
+    if d.ALLOWED:
+        fails += 1
+        print("FAIL the backstop did not set the defer off")
+    d.launch(conn, 60, 7, 1, 0, 0)  # the defer is off: launch waits at once
+    expect("defer off after a backstop", ["wait60"])
+    d.ALLOWED = True
     d.launch(conn, 7, 7, 1, 0, 0)
     d.before_launch(conn)  # the next launch finds the old record
     expect("backstop launch", ["wait7"])
-    if d.BACKSTOP != 2:
+    if d.BACKSTOP != 2 or d.ALLOWED:
         fails += 1
-        print(f"FAIL backstop count {d.BACKSTOP} != 2")
+        print(f"FAIL backstop count {d.BACKSTOP} != 2 or allowed {d.ALLOWED}")
 
+    d.ALLOWED = True
     ple_io.CHECK = 1
     d.launch(conn, 8, 7, 1, 0, 0)
     try:
@@ -155,6 +189,17 @@ def main() -> int:
     d.install(c1)
     d.launch(c1, 9, 7, 1, 0, 0)
     expect("MRV1 no defer", ["wait9"])
+
+    # A CUDA graph class without replay(): no guard, so no defer.
+    class NoReplay:
+        pass
+    d._graph_class = lambda: NoReplay
+    d.install(conn)
+    if d.ALLOWED:
+        fails += 1
+        print("FAIL install allowed the defer without the replay guard")
+    d.launch(conn, 10, 7, 1, 0, 0)
+    expect("no guard no defer", ["wait10"])
     ple_io.DEFER = 0
 
     # The hooks on the generated files (when start.sh made them).
