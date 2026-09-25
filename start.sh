@@ -120,7 +120,7 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S API_KEY
                     VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
                     MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE
-                    KERN_DECODE KERN_RPC LM_HEAD_FP8_RESCORE SHORTCONV_ASYNC_H2D MTP_DENSE_W8A16)
+                    KERN_DECODE KERN_RPC LM_HEAD_FP8_RESCORE SHORTCONV_ASYNC_H2D MTP_DENSE_W8A16 PLE_GPU_WAIT)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAP_$_v=\${$_v-}"
     eval "_SNAPSET_$_v=\${$_v+set}"
@@ -335,6 +335,9 @@ SHORTCONV_ASYNC_H2D="${SHORTCONV_ASYNC_H2D:-0}"
 # R4: MTP_DENSE_W8A16=1 gives the dense drafter linears FP8 row-scaled
 # copies and a W8A16 kernel for M <= 32 (+0.09 GB; the BF16 weights stay).
 MTP_DENSE_W8A16="${MTP_DENSE_W8A16:-0}"
+# R3a: PLE_GPU_WAIT=1 moves the PLE row wait from the host (before the graph
+# replay) to a GPU kernel inside the PLE layer (files/kern/ple_gpu_wait.py).
+PLE_GPU_WAIT="${PLE_GPU_WAIT:-0}"
 # disable_eagle_block_drop (plan 2.4 / review §6.1): speculative-config lever
 # that removes MTP's fixed prefix-cache-block back-off per turn. MTP_NUM_...
 # > 0 and this knob = merge into the speculative-config JSON.
@@ -705,13 +708,15 @@ if [[ "$KERN_DECODE" == 1 ]]; then
     KERN_MOUNTS+=" -v $KERN_DIR/out/kd_ext.py:/usr/local/lib/python3.12/dist-packages/kd_ext.py:ro"
     KERN_MOUNTS+=" -v $KERN_DIR/out/mtp_w8a16.py:$VLLM_PKG/models/qwen3_8_flash_next/nvidia/mtp_w8a16.py:ro"
     [[ "$MTP_DENSE_W8A16" == 1 ]] && KERN_MOUNTS+=" -e VLLM_MTP_DENSE_W8A16=1"
+    KERN_MOUNTS+=" -v $KERN_DIR/out/ple_gpu_wait.py:$VLLM_PKG/model_executor/layers/ple_gpu_wait.py:ro"
+    [[ "$PLE_GPU_WAIT" == 1 ]] && KERN_MOUNTS+=" -e VLLM_PLE_GPU_WAIT=1"
     [[ "$LM_HEAD_FP8_RESCORE" == 1 ]] && KERN_MOUNTS+=" -e VLLM_QWEN38_LM_HEAD_FP8=1"
     [[ "$SHORTCONV_ASYNC_H2D" == 1 ]] && KERN_MOUNTS+=" -e VLLM_SHORTCONV_ASYNC_H2D=1"
     if [[ "$KERN_RPC" == 1 ]]; then
         [[ "$BIND" == "127.0.0.1" ]] || err "KERN_RPC=1 needs BIND=127.0.0.1 (dev endpoints)"
         KERN_MOUNTS+=" -e VLLM_SERVER_DEV_MODE=1"
     fi
-elif [[ "$LM_HEAD_FP8_RESCORE" == 1 || "$SHORTCONV_ASYNC_H2D" == 1 || "$KERN_RPC" == 1 || "$MTP_DENSE_W8A16" == 1 ]]; then
+elif [[ "$LM_HEAD_FP8_RESCORE" == 1 || "$SHORTCONV_ASYNC_H2D" == 1 || "$KERN_RPC" == 1 || "$MTP_DENSE_W8A16" == 1 || "$PLE_GPU_WAIT" == 1 ]]; then
     err "LM_HEAD_FP8_RESCORE, SHORTCONV_ASYNC_H2D and KERN_RPC need KERN_DECODE=1"
 fi
 
@@ -731,6 +736,7 @@ for f in connector worker protocol; do
     extract "$VLLM_PKG/v1/ple_offload/$f.py" "$OFFLOAD_DIR/orig/$f.py"
 done
 python3 "$SCRIPT_DIR/files/patch_ple_offload.py"
+[[ "$KERN_DECODE" == 1 ]] && { python3 "$SCRIPT_DIR/files/kern/patch_ple_kern.py" "$OFFLOAD_DIR" || err "patch_ple_kern.py failed"; }
 for f in ple_offload_layer connector worker protocol; do
     [[ -f "$OFFLOAD_DIR/$f.py" ]] || err "offload patch missing: $f.py"
 done

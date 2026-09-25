@@ -146,4 +146,6 @@
 !/files/kern/lm_head_fp8.py
 !/files/kern/mtp_w8a16.py
 !/files/kern/patch_mtp_kern.py
+!/files/kern/patch_ple_kern.py
+!/files/kern/ple_gpu_wait.py
 !/tests/test_kern_ext.py

@@ -25,6 +25,11 @@ with the matching env var would run it:
                sizes 1..MAX_NUM_SEQS in CUDAGRAPH_CAPTURE_SIZES at launch.
   sc_async     R2. The module flag _ASYNC_H2D of the patched
                short_conv_attn.py (VLLM_SHORTCONV_ASYNC_H2D).
+  ple_gpu_wait R3a. The connector flag _GPU_WAIT_ON (VLLM_PLE_GPU_WAIT=1 at
+               launch): 1 = no host wait before the forward, the GPU kernel
+               in the PLE layer waits; 0 = the recipe host wait.
+  mtp_w8       R4. mtp_w8a16._ON (VLLM_MTP_DENSE_W8A16=1 at launch). The
+               drafter graphs bake the path in: set recapture with it.
   attr         {"module:attr": value}: set a module attribute of a kern
                patch (the flags of later rungs).
   recapture    true: capture all CUDA graphs again (target and drafter).
@@ -246,6 +251,10 @@ class KDExt:
         info["verify_graphs"] = r.cudagraph_manager.captured_token_counts()
         sc = sys.modules.get("vllm.v1.attention.backends.short_conv_attn")
         info["sc_async"] = getattr(sc, "_ASYNC_H2D", None)
+        con = sys.modules.get("vllm.v1.ple_offload.connector")
+        info["ple_gpu_wait"] = getattr(con, "_GPU_WAIT_ON", None) if getattr(con, "_GPU_WAIT", False) else None
+        w8 = sys.modules.get("vllm.models.qwen3_8_flash_next.nvidia.mtp_w8a16")
+        info["mtp_w8"] = getattr(w8, "_ON", None)
         return info
 
     def kd_set(self, spec_json):
@@ -277,6 +286,18 @@ class KDExt:
                 raise RuntimeError("sc_async: short_conv_attn.py is not the patched file")
             mod._ASYNC_H2D = bool(knobs["sc_async"])
             done["sc_async"] = mod._ASYNC_H2D
+        if "ple_gpu_wait" in knobs:
+            mod = sys.modules.get("vllm.v1.ple_offload.connector")
+            if mod is None or not getattr(mod, "_GPU_WAIT", False):
+                raise RuntimeError("ple_gpu_wait: needs VLLM_PLE_GPU_WAIT=1 at launch")
+            mod._GPU_WAIT_ON = bool(knobs["ple_gpu_wait"])
+            done["ple_gpu_wait"] = mod._GPU_WAIT_ON
+        if "mtp_w8" in knobs:
+            mod = sys.modules.get("vllm.models.qwen3_8_flash_next.nvidia.mtp_w8a16")
+            if mod is None:
+                raise RuntimeError("mtp_w8: needs VLLM_MTP_DENSE_W8A16=1 at launch")
+            mod._ON = bool(knobs["mtp_w8"])
+            done["mtp_w8"] = mod._ON
         for key, val in (knobs.get("attr") or {}).items():
             mname, aname = key.split(":")
             mod = importlib.import_module(mname)
