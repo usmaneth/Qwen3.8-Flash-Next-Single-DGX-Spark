@@ -56,6 +56,16 @@
 !/files/ple_io/ple_io_fast.py
 !/files/ple_io/patch_fast.py
 !/files/ple_io/test_fast.py
+# --- PLE on the device (TECHNIQUES.md #7, fx-ple) ---
+!/files/ple_dev/ple_ids_triton.py
+!/files/ple_dev/ple_gpu_twin.py
+!/files/ple_dev/streams.py
+!/files/ple_dev/parity_real.py
+!/files/ple_dev/coldmiss.py
+!/files/ple_dev/mincore_watch.py
+!/files/ple_dev/g6_bench.py
+!/files/ple_dev/lease_g6.sh
+!/files/ple_dev/run_cpu.sh
 # the compiled prefetch library (built in the image, lease step 0)
 /files/ple_io/build/
 !/files/mtp_block.py
