@@ -45,6 +45,19 @@
 !/files/patch_ple_layer.py
 !/files/patch_modelopt_mxfp8.py
 !/files/patch_ple_offload.py
+!/files/ple_io/ple_io.py
+!/files/ple_io/patch_ple_io.py
+!/files/ple_io/test_ple_io.py
+!/files/ple_io/ple_io_native.c
+!/files/ple_io/bench_ple_io.py
+!/files/ple_io/ple_io_defer.py
+!/files/ple_io/patch_defer.py
+!/files/ple_io/test_defer.py
+!/files/ple_io/ple_io_fast.py
+!/files/ple_io/patch_fast.py
+!/files/ple_io/test_fast.py
+# the compiled prefetch library (built in the image, lease step 0)
+/files/ple_io/build/
 !/files/mtp_block.py
 !/files/patch_qsa_fp8_kv.py
 !/files/patch_mtp_draft_vocab.py

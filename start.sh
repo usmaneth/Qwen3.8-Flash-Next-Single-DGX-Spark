@@ -126,9 +126,16 @@ for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAPSET_$_v=\${$_v+set}"
 done
 
+# The PLE row I/O knobs (VLLM_PLE_IO_*, files/ple_io/ple_io.py) also honour
+# "environment > .env".
+declare -A _PLE_IO_SNAP=()
+for _v in $(compgen -v VLLM_PLE_IO_ || true); do _PLE_IO_SNAP[$_v]="${!_v}"; done
+
 [[ -f .env ]] || err ".env not found. Copy .env.sample to .env and edit it."
 # shellcheck source=.env
 source .env
+
+for _v in "${!_PLE_IO_SNAP[@]}"; do printf -v "$_v" '%s' "${_PLE_IO_SNAP[$_v]}"; done
 
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     if [[ -n "$(eval "printf %s \"\${_SNAPSET_$_v-}\"")" ]]; then
@@ -699,6 +706,24 @@ python3 "$SCRIPT_DIR/files/patch_ple_offload.py"
 for f in ple_offload_layer connector worker protocol; do
     [[ -f "$OFFLOAD_DIR/$f.py" ]] || err "offload patch missing: $f.py"
 done
+# PLE row I/O hook (files/ple_io): the gather, its optional trace, and the
+# hooks of files/ple_io/patch_*.py.
+python3 "$SCRIPT_DIR/files/ple_io/patch_ple_io.py" || err "patch_ple_io.py failed"
+# Every VLLM_PLE_IO_* variable (environment or .env) goes into the container.
+# The optional modules and the native prefetch library are mounted when present.
+PLE_IO_ARGS=""
+for _v in $(compgen -v VLLM_PLE_IO_ || true); do
+    [[ "${!_v}" =~ ^[A-Za-z0-9_./=,:-]*$ ]] || err "$_v has an unsafe value: '${!_v}'"
+    PLE_IO_ARGS+=" -e $_v=${!_v}"
+done
+for _f in ple_io_defer ple_io_fast; do
+    [[ -f "$SCRIPT_DIR/files/ple_io/$_f.py" ]] && \
+        PLE_IO_ARGS+=" -v $SCRIPT_DIR/files/ple_io/$_f.py:$VLLM_PKG/v1/ple_offload/$_f.py:ro"
+done
+if [[ -f "$SCRIPT_DIR/files/ple_io/build/libple_io_native.so" ]]; then
+    PLE_IO_ARGS+=" -v $SCRIPT_DIR/files/ple_io/build/libple_io_native.so:/opt/ple_io/libple_io_native.so:ro"
+fi
+[[ -n "$PLE_IO_ARGS" ]] && info "  PLE row I/O:$PLE_IO_ARGS"
 ok "Patches ready."
 
 # ---------------------------------------------------------------------------
@@ -1124,6 +1149,8 @@ docker run \\
     -v $OFFLOAD_DIR/connector.py:$VLLM_PKG/v1/ple_offload/connector.py:ro \\
     -v $OFFLOAD_DIR/worker.py:$VLLM_PKG/v1/ple_offload/worker.py:ro \\
     -v $OFFLOAD_DIR/protocol.py:$VLLM_PKG/v1/ple_offload/protocol.py:ro \\
+    -v $SCRIPT_DIR/files/ple_io/ple_io.py:$VLLM_PKG/v1/ple_offload/ple_io.py:ro \\
+    $PLE_IO_ARGS \\
     -v $HF_CACHE_DIR:/root/.cache/huggingface \\
     -v $HOME/.cache/vllm:/root/.cache/vllm \\
     $PT_EXTRA_MOUNTS \\
