@@ -772,6 +772,15 @@ if [[ "$BOOT_FAST_WINDOW$BOOT_FAST_MTP_FILES$BOOT_FAST_PLE_FILES$BOOT_FAST_EXPER
         _bf_mount "$OURS/routed_experts.py" model_executor/layers/fused_moe/routed_experts.py
         info "  R4 expert lookup: on"
     fi
+    if [[ "$BOOT_HASH" == "1" ]]; then
+        extract "$VLLM_PKG/v1/worker/gpu/model_runner.py" "$OURS/model_runner.py.orig"
+        python3 "$OURS/patch_model_runner_hash.py" >/dev/null || err "patch_model_runner_hash.py failed"
+        _bf_mount "$OURS/model_runner.py" v1/worker/gpu/model_runner.py
+        _bf_mount "$OURS/boot_hash.py" boot_hash.py
+        mkdir -p "$BOOT_HASH_DIR"
+        BF_DOCKER_ARGS+=" -v $BOOT_HASH_DIR:/root/boot-hash -e VLLM_BOOT_HASH_DIR=/root/boot-hash -e VLLM_MTP_GUARD_RECORD=1"
+        info "  G1 weight hash: $BOOT_HASH_DIR"
+    fi
     if [[ "$BOOT_TRACE" == "1" ]]; then
         mkdir -p "$BOOT_TRACE_DIR"
         BF_DOCKER_ARGS+=" -v $BOOT_TRACE_DIR:/root/boot-trace -e VLLM_ST_TRACE_DIR=/root/boot-trace"

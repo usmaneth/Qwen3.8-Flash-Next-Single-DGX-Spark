@@ -140,3 +140,5 @@
 !/files/ours/patch_mtp_file_filter.py
 !/files/ours/patch_ple_offload_files.py
 !/files/ours/patch_routed_experts_lookup.py
+!/files/ours/boot_hash.py
+!/files/ours/patch_model_runner_hash.py
