@@ -89,14 +89,18 @@ def _ple_ids_kernel(ids_ptr, qsl_ptr, nctx_ptr, mult_ptr, sizes_ptr, offs_ptr,
 
 
 @triton.jit
-def _ple_gather_kernel(table_ptr, rid_ptr, out_ptr, ROW: tl.constexpr,
+def _ple_gather_kernel(table_addr, rid_ptr, out_ptr, ROW: tl.constexpr,
                        BLOCK: tl.constexpr):
     """One program per (token, head): copy one ROW-byte row.
 
-    table_ptr is the uint8 base of the read-only mmap of the packed table.
+    table_addr is the int64 address of the read-only mmap of the packed table.
     The GPU reads it through ATS (no copy to device memory). A page that is
     not in the page cache faults to the host and stalls this program.
+    The launcher does not check an integer argument. It checks a pointer
+    argument with cuPointerGetAttribute, and that check fails for an
+    unregistered host mmap.
     """
+    table_ptr = table_addr.to(tl.pointer_type(tl.uint8))
     i = tl.program_id(0)
     rid = tl.load(rid_ptr + i)                 # int64
     src = rid * ROW                            # rule 7: int64 byte offset
@@ -116,8 +120,11 @@ def ple_ids(ids, qsl, nctx, mult, sizes, offs, out, eos: int, hpn: int = 8):
 
 
 def ple_gather(table_u8, rids, out_u8, row: int = 90):
+    """table_u8 is a tensor over the table or its int address."""
     n = rids.numel()
-    _ple_gather_kernel[(n,)](table_u8, rids, out_u8, ROW=row, BLOCK=128)
+    addr = table_u8 if isinstance(table_u8, int) else table_u8.data_ptr()
+    assert addr >= 1 << 32, "the table address must be an int64 argument"
+    _ple_gather_kernel[(n,)](addr, rids, out_u8, ROW=row, BLOCK=128)
     return out_u8
 
 
