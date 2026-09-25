@@ -350,7 +350,10 @@ def main() -> int:
     if not res["K2_equal"]:
         return done(12)
     # K3 + G6 need the GPU.
-    dec = [g for g in gold if int(g["num"]) == 7 and g["qsl"].size == 2 and g["cls"] in ("real", "pad")]
+    # The G6 graph is the (T_pad 7, 1 request) graph, so a step must have 7 ids.
+    # The "pad" decode steps of the golden data have T_pad 8 and no graph.
+    dec = [g for g in gold if int(g["num"]) == 7 and g["qsl"].size == 2 and g["ids"].size == 7
+           and g["cls"] in ("real", "pad")]
     res["G6_steps_available"] = len(dec)
     if a.cpu_dry:
         # Harness logic only: the lead schedule and the cold page choice.
