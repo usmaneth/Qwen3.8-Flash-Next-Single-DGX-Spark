@@ -57,7 +57,21 @@ MIN_N = 64  # smaller outputs (the shared-expert gate, 1 x 2560) stay BF16
 
 # (N, K) -> (BN, BK, SPLIT, warps, stages). Filled by the tile sweep
 # (tools/w8a16_bench.py); a shape that is not here uses default_tile().
-TILES: dict = {}
+# Best M=1 tiles from the kern-micro-1 sweep (spark2, 2026-09-24,
+# runs/kern-micro-1-spark2-20260924T214504/w8a16.json, cold weights).
+TILES: dict = {
+    (320, 10240): (32, 256, 4, 4, 3),
+    (336, 10240): (32, 256, 4, 4, 3),
+    (512, 2560): (64, 128, 4, 8, 3),
+    (640, 2560): (32, 256, 1, 4, 3),
+    (1280, 2560): (32, 256, 1, 4, 3),
+    (2560, 640): (32, 128, 1, 4, 3),
+    (2560, 2560): (32, 256, 1, 4, 3),
+    (2560, 6144): (64, 256, 1, 8, 3),
+    (10240, 320): (16, 128, 1, 4, 3),
+    (13312, 2560): (16, 256, 1, 4, 3),
+    (47184, 2560): (64, 256, 1, 8, 3),
+}
 
 
 def default_tile(n: int, k: int, sms: int = 48):
